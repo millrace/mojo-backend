@@ -1,0 +1,6 @@
+# Ad-hoc / throwaway output (see CLAUDE.md)
+.scratch/
+
+# Mojo / pixi build artifacts
+build/
+.pixi/
