@@ -4,3 +4,7 @@
 # Mojo / pixi build artifacts
 build/
 .pixi/
+
+# Python caches (oracle / test scripts)
+__pycache__/
+*.pyc

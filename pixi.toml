@@ -15,9 +15,37 @@ platforms = ["osx-arm64"]
 [dependencies]
 mojo = "*"
 
+# The conformance oracle (ARCHITECTURE.md §7) — a SEPARATE environment so the
+# default build stays Mojo-only and fast. transformers/torch on CPU/f32 is the
+# trusted reference (the §7 "transformers-equivalent" oracle); we capture real
+# Qwen2 attention internals from it via forward hooks, which MAX's compiled graph
+# does not expose. The default feature (mojo) is auto-included in every env, so
+# the `oracle` env has both Python and Mojo.
+[feature.oracle.dependencies]
+python = ">=3.11"
+numpy = "*"
+pytorch = "*"
+transformers = "*"
+safetensors = "*"
+huggingface_hub = "*"
+
+[environments]
+oracle = ["oracle"]
+
 [tasks]
 # Phase 0 go/no-go: confirm a hand-written Mojo Metal kernel runs and computes
 # correctly on this M4 (re-confirms max-backend §8 #2 rung 1) before betting the
 # project on the GPU-only path. Exits non-zero on any mismatch / no accelerator.
 gpu-hello = "mojo run src/gpu_hello.mojo"
 build-gpu-hello = "mkdir -p build && mojo build src/gpu_hello.mojo -o build/gpu_hello"
+
+# Phase 1 go/no-go (ARCHITECTURE.md §6): the attention+RoPE spike — the kernel
+# MAX got wrong on Metal. `attn-kernel` runs our hand-written Mojo Metal kernel
+# against fixtures and exits non-zero on mismatch (default env). `attn-capture`
+# regenerates fixtures + the NumPy reference from HF (oracle env).
+attn-kernel = "mojo run src/attention_spike.mojo"
+
+[feature.oracle.tasks]
+# Generates tests/fixtures/attention/{synthetic,real_L0,real_L23}/ : q/k/v.bin,
+# expected.bin (NumPy ref), meta.txt. Also asserts NumPy ref ≈ HF context.
+attn-capture = "python tests/manual/attention_spike/capture.py"

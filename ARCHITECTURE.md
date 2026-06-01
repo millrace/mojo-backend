@@ -263,8 +263,8 @@ positions), so it is verifiable in isolation with no other component built.
 
 | Phase | Delivers |
 |---|---|
-| **0 — Scaffold** | pixi env (Mojo + GPU/Metal, nightly), repo layout, this doc. **A Mojo GPU hello kernel runs on the M4** — re-confirms max-backend rung 1 (hand-written Mojo Metal kernels execute *and* compute correctly) on a clean env, before betting the project on it. |
-| **1 — Attention + RoPE spike (the go/no-go gate)** | The risky kernel, first and alone. A Mojo Metal kernel for RoPE (split-half, θ=1e6) + causal GQA attention at the real Qwen2 dims (head_dim 64, 14:2 heads), **diffed against a from-scratch NumPy/torch reference** on both synthetic inputs and **captured-real layer Q/K/V fixtures dumped from MAX-CPU** (so it is tested on realistic magnitudes, not just random). Adds the MAX-CPU oracle as a separate pixi feature/env. If this can't match the reference, the GPU-only thesis is wrong — and we learn it on day one, not after building everything else. |
+| **0 — Scaffold** *(✅ done)* | pixi env (Mojo + GPU/Metal, nightly), repo layout, this doc. **A Mojo GPU hello kernel runs on the M4** — re-confirms max-backend rung 1 (hand-written Mojo Metal kernels execute *and* compute correctly) on a clean env, before betting the project on it. `pixi run gpu-hello` ✅. |
+| **1 — Attention + RoPE spike (the go/no-go gate)** *(✅ done — passed)* | The risky kernel, first and alone. A Mojo Metal kernel for RoPE (split-half, θ=1e6) + causal GQA attention at the real Qwen2 dims (head_dim 64, 14:2 heads), **diffed against a from-scratch NumPy reference** on both synthetic inputs and **captured-real layer Q/K/V fixtures from the model run** (so it is tested on realistic magnitudes, not just random). **Result: GPU output matches the reference to ≤ 8.4e-6 abs on synthetic + real layer-0 + real layer-23 — the kernel MAX got wrong on Metal, we got right.** See §11. |
 | **2 — Remaining kernels + loader + tokenizer** | The known-reachable work (max-backend rungs 1–5 already proved matmul/norm/SiLU/MLP correct on Metal): matmul, RMSNorm, SwiGLU MLP GPU kernels; safetensors loader (bf16→f32, device upload); byte-level BPE encode/decode verified against `transformers` ids. Each kernel diffed against MAX-CPU/f32. |
 | **3 — Forward pass** | Assemble embed → 24 layers → final norm → tied head on GPU/f32. **Logits match MAX-CPU/f32** at the last prompt position (greedy argmax agrees). Layer-bisection (force 1/2/24 layers) localizes any divergence — the exact technique max-backend used (its §8 #2 rung 6). |
 | **4 — Decode loop + KV cache** | Prefill + incremental greedy decode on-device, EOS handling, `--max-tokens`. **Token-for-token greedy parity** with MAX-CPU on the conformance prompts (§7). |
@@ -278,16 +278,24 @@ positions), so it is verifiable in isolation with no other component built.
 Same philosophy as minja2's byte-equality (its §9): **one authoritative signal**,
 checked against a trusted oracle.
 
-- **Oracle: MAX running on CPU/float32** with **greedy decoding**
-  (`do_sample=false`) — the path max-backend proved coherent (its §8 #2). Our
-  **GPU/f32** output is diffed against it, so a mismatch points at our Metal
-  kernels, not at a dtype or a wrong reference. (`transformers`/CPU is an
-  equivalent fallback oracle for the tokenizer and logit checks.)
+- **Two oracles, by altitude (both CPU/f32, numerically equivalent):**
+  - **Per-kernel → HF transformers (CPU/f32).** For an isolated op, HF eager
+    attention is the better reference: it exposes per-layer Q/K/V and the
+    post-attention context through forward hooks (MAX's compiled graph does not),
+    and we own a from-scratch NumPy reference of the math that is first
+    cross-checked against HF on real activations. Used in Phase 1 (§11 #2).
+  - **Whole-model → MAX running on CPU/float32**, greedy (`do_sample=false`) —
+    the path max-backend proved coherent (its §8 #2). For end-to-end logits and
+    token parity (Phase 3–4), where per-layer hooks aren't needed and agreement
+    with a full production engine is the point.
+  Our **GPU/f32** output is diffed against these, so a mismatch points at our
+  Metal kernels, not a dtype or a wrong reference.
 - **Signals, in order of strictness:**
   1. **Tokenizer:** our `encode(prompt)` == reference token ids; `decode` round-trips.
   2. **Per-kernel:** each GPU op (matmul, norm, SiLU, MLP, RoPE, attention) diffed
-     against the MAX-CPU/f32 result for the same inputs — the rung-by-rung ladder
+     against the reference for the same inputs — the rung-by-rung ladder
      max-backend built (its §8 #2 rungs 1–6), now applied to *our* kernels.
+     **Attention+RoPE done — ≤ 8.4e-6 (§11 #1).**
   3. **Logits:** GPU last-position logits ≈ MAX-CPU within f32 tolerance, and
      `argmax` agrees exactly. Bisect by layer count (force 1/2/24 layers) to
      localize any divergence (max-backend §8 #2 rung 6).
@@ -363,3 +371,35 @@ server is ported (Phase 6), the millrace request path is pure Mojo from socket t
 logits, running on the Apple Silicon GPU, with **no Python and no MAX at
 runtime** — the stance max-backend set out with and had to defer. MAX survives
 only as the CPU oracle that tells us our GPU kernels are right.
+
+## 11. Phase-1 findings (empirical)
+
+Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
+
+1. **Hand-written Mojo Metal RoPE + causal GQA attention is correct — the
+   go/no-go gate passed.** The spike kernel (`src/attention_spike.mojo`: one GPU
+   thread per (query position, query head), split-half RoPE at θ=1e6, online
+   softmax, GQA 14:2) matches a from-scratch NumPy reference to **≤ 8.4e-6
+   absolute** on three fixtures: synthetic random Q/K/V, and **real** Q/K/V
+   captured from Qwen2.5-0.5B layer 0 and layer 23. This is the exact kernel
+   class MAX's Metal backend got *wrong* (max-backend §8 #2 rung 6), so the
+   load-bearing risk (§9 #3) is retired: writing our own attention/RoPE on Metal
+   is coherent. Reproduce: `pixi run attn-capture` then `pixi run attn-kernel`.
+2. **The oracle is HF transformers (CPU/f32), not MAX — a deliberate, equivalent
+   substitution for *this* spike.** ARCHITECTURE called for MAX-CPU (§7), but for
+   a single-kernel check HF eager attention is the better oracle: it exposes the
+   per-layer Q/K/V and post-attention context through forward hooks (MAX's
+   compiled graph does not), and CPU/f32 numerics are equivalent to MAX-CPU/f32.
+   The NumPy reference is the actual comparison target; it was first
+   **cross-checked against HF's own attention output to ~1e-6** on the captured
+   activations (`capture.py`), so "matches the reference" means "matches a
+   trusted real implementation on real data". MAX-CPU remains the **whole-model**
+   oracle from Phase 3 (logits, token parity), where per-layer hooks aren't
+   needed and end-to-end MAX agreement is what matters. §7 updated to reflect
+   this split.
+3. **Mojo nightly API notes (1.0.0b2).** `def` does **not** imply `raises` (add
+   it explicitly); `fn` is removed. Runtime-extent layouts use `row_major(n)`
+   with a plain `Int` (not `Idx(n)`). `open()` takes `"r"`/`"w"`, not `"rb"`;
+   `FileHandle.read_bytes()` returns the raw bytes regardless. List values must
+   be transferred out of functions with `^`. These are captured by the installed
+   `mojo-syntax` / `mojo-gpu-fundamentals` skills (`.claude/skills/`).
