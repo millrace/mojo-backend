@@ -217,15 +217,27 @@ Qwen's GPT-2 regex split.
 The prompt string is produced by [`../minja2`](../minja2/docs/requirements.md)
 rendering the real Qwen2.5 `chat_template` (vendored at
 `assets/qwen2.5-chat-template.jinja`) with `add_generation_prompt=true`.
-`src/chat.mojo` compiles the template once and renders it per request: the
-messages context is built as JSON and parsed into a minja2 `Value`
-(`render_chat`). minja2 compiles cleanly under the same 1.0.0b2 nightly the GPU
+`src/chat.mojo` compiles the template once and renders it per request.
+`render_request(tmpl, body)` parses the OpenAI request body with minja2's
+`parse_json` and passes its **full `messages` history and `tools`** straight
+through (the same inputs `apply_chat_template` takes), adding
+`add_generation_prompt`; `render_chat(tmpl, user)` is the single-turn convenience
+the CLI uses. minja2 compiles cleanly under the same 1.0.0b2 nightly the GPU
 engine needs (unlike flare, §11 #11) and is pulled in at build time via
-`-I ../minja2/src`. It targets byte-identical output vs.
-`transformers.apply_chat_template`, so the prompt is trusted; we feed it to the
-tokenizer (§5.2). No BOS is added (`bos_token: null`). The CLI (`pixi run chat`)
-and server (`pixi run serve`) both use this path; both still answer "What is the
-capital of France?" → "The capital of France is Paris."
+`-I ../minja2/src`. No BOS is added (`bos_token: null`).
+
+**Verified byte-identical to `transformers.apply_chat_template`** on multi-turn
+(system+user+assistant+user), no-system multi-turn, and a tools request
+(`.scratch/verify_minja2_multiturn.py`). Two minja2 fixes were needed so it
+matches the *real* `apply_chat_template` rather than the vanilla
+`jinja2.Environment(StrictUndefined)` its conformance harness uses as reference:
+(a) `not`/`and`/`or` treat undefined as falsy (so `not message.tool_calls` works
+on assistant turns), and (b) `tojson` preserves insertion order
+(`sort_keys=False`, as transformers configures jinja2) so tool definitions match
+byte-for-byte. These diverge from minja2's current conformance reference (which
+is itself mis-configured vs transformers) — re-orienting that reference is a
+minja2 follow-up. Live: multi-turn "Add 10 to that." after "2+2=4" → "11"; a
+`get_weather` tools request → a well-formed `<tool_call>`.
 
 ### 5.4 KV cache
 Single-sequence cache of per-layer K and V (`[num_kv_heads=2, T, head_dim=64]`),

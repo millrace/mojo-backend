@@ -10,6 +10,7 @@ under the same 1.0.0b2 nightly the GPU engine needs — unlike flare, §11 #11).
 """
 
 from template import Template
+from value import Value
 from json import parse_json
 
 
@@ -38,12 +39,35 @@ def load_chat_template(path: String) raises -> Template:
         return Template.compile(f.read())
 
 
-def render_chat(tmpl: Template, user: String) raises -> String:
-    """Render the template for a single user turn with add_generation_prompt."""
-    var ctx_json = (
-        String('{"messages":[{"role":"user","content":"')
-        + json_escape(user)
-        + '"}],"add_generation_prompt":true,"tools":null}'
-    )
-    var ctx = parse_json(ctx_json)
+def render_request(tmpl: Template, body: String) raises -> String:
+    """Render the template from an OpenAI-style request body.
+
+    The body's `messages` (full multi-turn history, with any `tool_calls`) and
+    optional `tools` are exactly the shape the Qwen template consumes — the same
+    inputs transformers' apply_chat_template takes — so we parse the request JSON
+    and pass them straight through, adding `add_generation_prompt`.
+    """
+    var req = parse_json(body)
+    var msgs = req.map_get("messages")
+    if not msgs:
+        raise Error("request has no 'messages' array")
+
+    var ctx = Value.mapping()
+    ctx.map_set("messages", msgs.value())
+    ctx.map_set("add_generation_prompt", Value.bool(True))
+
+    var tools = req.map_get("tools")
+    if tools and not tools.value().is_none():
+        ctx.map_set("tools", tools.value())
+    else:
+        ctx.map_set("tools", Value.none())
+
     return tmpl.render(ctx^, 0)
+
+
+def render_chat(tmpl: Template, user: String) raises -> String:
+    """Convenience for a single user turn (the CLI), via `render_request`."""
+    var body = (
+        String('{"messages":[{"role":"user","content":"') + json_escape(user) + '"}]}'
+    )
+    return render_request(tmpl, body)

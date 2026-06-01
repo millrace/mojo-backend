@@ -20,7 +20,7 @@ from std.gpu.host import DeviceContext
 
 from model import Weights, load_weights, generate, EOS1, EOS2
 from tokenizer import Tokenizer, load_tokenizer
-from chat import load_chat_template, render_chat, json_escape
+from chat import load_chat_template, render_request, json_escape
 
 comptime TEMPLATE = "assets/qwen2.5-chat-template.jinja"
 
@@ -48,50 +48,15 @@ def ascii_str(bytes: List[UInt8]) -> String:
         s += chr(Int(bytes[i]))
     return s^
 
-def last_content(req: String) -> String:
-    """Crude extraction of the final "content":"…" string value in the body."""
-    var key = String('"content"')
-    var rb = req.as_bytes()
-    var kb = key.as_bytes()
-    # find last occurrence of the key
-    var at = -1
-    for i in range(len(rb) - len(kb) + 1):
-        var hit = True
-        for j in range(len(kb)):
-            if rb[i + j] != kb[j]:
-                hit = False
-                break
-        if hit:
-            at = i
-    if at < 0:
+def http_body(req: String) -> String:
+    """The bytes after the blank line separating HTTP headers from the body."""
+    var idx = req.find("\r\n\r\n")
+    if idx < 0:
         return String("")
-    # advance to the opening quote of the value
-    var p = at + len(kb)
-    while p < len(rb) and Int(rb[p]) != 34:  # skip to '"'
-        p += 1
-    p += 1
-    # read until unescaped '"'
+    var rb = req.as_bytes()
     var out = String("")
-    while p < len(rb):
-        var c = Int(rb[p])
-        if c == 92 and p + 1 < len(rb):  # backslash escape
-            var n = Int(rb[p + 1])
-            if n == 110:
-                out += "\n"
-            elif n == 116:
-                out += "\t"
-            elif n == 34:
-                out += "\""
-            elif n == 92:
-                out += "\\"
-            else:
-                out += chr(n)
-            p += 2
-            continue
-        if c == 34:
-            break
-        out += chr(c)
-        p += 1
+    for i in range(idx + 4, len(rb)):
+        out += chr(Int(rb[i]))
     return out^
 
 
@@ -142,20 +107,23 @@ def main() raises:
         if req.find("/v1/models") >= 0 and req.find("GET") >= 0:
             http_response(conn, String('{"object":"list","data":[{"id":"qwen2.5-0.5b-instruct","object":"model","owned_by":"millrace"}]}'))
         else:
-            var user = last_content(req)
-            print("  prompt: ", user, sep="")
-            var ids = tok.encode(to_bytes(render_chat(tmpl, user)))
-            var gen = generate(ctx, w, ids, MAX_NEW)
-            var body_ids = List[Int]()
-            for i in range(len(gen)):
-                if gen[i] == EOS1 or gen[i] == EOS2:
-                    break
-                body_ids.append(gen[i])
-            var text = ascii_str(tok.decode(body_ids))
-            print("  reply:  ", text, sep="")
-            var json = String('{"id":"chatcmpl-millrace","object":"chat.completion","model":"qwen2.5-0.5b-instruct",')
-            json += '"choices":[{"index":0,"message":{"role":"assistant","content":"'
-            json += json_escape(text)
-            json += '"},"finish_reason":"stop"}]}'
-            http_response(conn, json)
+            try:
+                var prompt = render_request(tmpl, http_body(req))
+                var ids = tok.encode(to_bytes(prompt))
+                var gen = generate(ctx, w, ids, MAX_NEW)
+                var body_ids = List[Int]()
+                for i in range(len(gen)):
+                    if gen[i] == EOS1 or gen[i] == EOS2:
+                        break
+                    body_ids.append(gen[i])
+                var text = ascii_str(tok.decode(body_ids))
+                print("  reply:  ", text, sep="")
+                var json = String('{"id":"chatcmpl-millrace","object":"chat.completion","model":"qwen2.5-0.5b-instruct",')
+                json += '"choices":[{"index":0,"message":{"role":"assistant","content":"'
+                json += json_escape(text)
+                json += '"},"finish_reason":"stop"}]}'
+                http_response(conn, json)
+            except e:
+                print("  error: ", String(e), sep="")
+                http_response(conn, String('{"error":{"message":"') + json_escape(String(e)) + '"}}')
         _ = external_call["close", c_int](conn)
