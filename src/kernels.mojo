@@ -9,7 +9,7 @@ Hardcoded to Qwen2.5-0.5B (ARCHITECTURE.md §2): 14 query heads, 2 kv heads,
 head_dim 64, RoPE θ=1e6, RMSNorm ε=1e-6.
 """
 
-from std.math import sqrt, exp, log, cos, sin
+from std.math import sqrt, exp, log, cos, sin, ceildiv
 from std.gpu import global_idx, WARP_SIZE
 from std.gpu.primitives.warp import sum as warp_sum, max as warp_max
 from std.collections import InlineArray
@@ -155,6 +155,67 @@ def matmul_kernel[
         Y[m * N + n] = rebind[Y.ElementType](total)
 
 
+def matmul_tiled_kernel[
+    LT: TensorLayout, TM: Int, CN: Int
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],
+    W: TileTensor[DType.uint16, LT, MutAnyOrigin],   # bf16 weights (raw u16 bits)
+    B: TileTensor[DType.float32, LT, MutAnyOrigin],
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    M: Int,
+    K: Int,
+    N: Int,
+    use_bias: Int,
+):
+    """Y[M,N] = X[M,K] · W[N,K]ᵀ (+bias) for the *prefill* path (M > 1).
+
+    The decode GEMV (matmul_kernel) gives each (m,n) output its own warp, so it
+    re-streams the whole weight matrix once per token. At prefill (M ≈ thousands)
+    that is M× the weight traffic. A first cut tiled only the token axis (TM
+    tokens/warp, each weight read once and reused TM×), but profiling a 2048-token
+    prefill showed it stalled at ~110 GFLOP/s: each of the N output columns got its
+    own warp that re-streamed the *whole* X matrix, so X traffic was N·M·K·4 ≈
+    36 GB for the MLP gate — 16× the weight traffic and the real bottleneck.
+
+    So tile *both* axes: a warp owns a TM-token × CN-column block (m0…, n0…). Its
+    lanes split K; per k each lane reads TM X-values and CN weights once and does
+    TM·CN MACs, so X is reused CN× and W is reused TM× — cutting X traffic CN-fold.
+    The TM·CN partials are reduced with `warp_sum` at the end. Pure f32 accumulate
+    + bf16 widen and the same lane-strided-K → warp_sum reduction as the GEMV, so
+    output is bit-identical and greedy parity is preserved (§11 #8, #12). TM=CN=8
+    measured ~2× the token-only kernel (~210 GFLOP/s) on the M4."""
+    comptime assert X.flat_rank == 1
+    var ncols = ceildiv(N, CN)
+    var tile = Int(global_idx.x) // WARP_SIZE     # one warp per (column-tile, token-tile)
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if tile >= ncols * ceildiv(M, TM):
+        return
+    var n0 = (tile % ncols) * CN
+    var m0 = (tile // ncols) * TM
+    var acc = InlineArray[Float32, TM * CN](fill=0.0)
+    for k in range(lane, K, WARP_SIZE):
+        var wv = InlineArray[Float32, CN](fill=0.0)
+        for c in range(CN):
+            if n0 + c < N:
+                wv[c] = bf16_widen(rebind[Scalar[DType.uint16]](W[(n0 + c) * K + k]))
+        for mm in range(TM):
+            var m = m0 + mm
+            if m < M:
+                var xv = rebind[Scalar[DType.float32]](X[m * K + k])
+                for c in range(CN):
+                    acc[mm * CN + c] += xv * wv[c]
+    for mm in range(TM):
+        var m = m0 + mm
+        for c in range(CN):
+            var total = warp_sum(acc[mm * CN + c])   # warp collective — every lane
+            var n = n0 + c
+            if lane == 0 and m < M and n < N:
+                var bias = Float32(0.0)
+                if use_bias != 0:
+                    bias = rebind[Scalar[DType.float32]](B[n])
+                Y[m * N + n] = rebind[Y.ElementType](total + bias)
+
+
 def silu_mul_kernel[
     LT: TensorLayout
 ](
@@ -185,6 +246,24 @@ def copy_kernel[
     if i >= n:
         return
     dst[dst_offset + i] = rebind[dst.ElementType](src[i])
+
+
+def slice_row_kernel[
+    LT: TensorLayout
+](
+    src: TileTensor[DType.float32, LT, MutAnyOrigin],
+    dst: TileTensor[DType.float32, LT, MutAnyOrigin],
+    src_offset: Int,
+    n: Int,
+):
+    """Copy n contiguous elements from src starting at src_offset into dst[0:n].
+    Used to lift the last token's hidden row out before the LM head, so prefill
+    runs the (VOCAB-wide) head on one row instead of all T (§11 #12)."""
+    comptime assert dst.flat_rank == 1
+    var i = global_idx.x
+    if i >= n:
+        return
+    dst[i] = rebind[dst.ElementType](src[src_offset + i])
 
 
 def rope_k_kernel[

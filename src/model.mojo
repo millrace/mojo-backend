@@ -18,6 +18,7 @@ from layout import TileTensor, row_major
 
 from kernels import (
     cvt_kernel, embed_kernel, add_kernel, rmsnorm_kernel, matmul_kernel,
+    matmul_tiled_kernel, slice_row_kernel,
     silu_mul_kernel, attn_cached_kernel, copy_kernel, rope_k_kernel, rope_q_kernel,
 )
 comptime HQ = 14
@@ -327,14 +328,29 @@ def mm(ctx: DeviceContext, mut x: DevBuf, mut w: WBuf, mut b: DevBuf,
        M: Int, K: Int, N: Int, use_bias: Int) raises -> DevBuf:
     var y = ctx.enqueue_create_buffer[DType.float32](M * N)
     var lay = row_major(M * N)
-    comptime k = matmul_kernel[type_of(lay)]
-    ctx.enqueue_function[k](
-        TileTensor(x, row_major(M * K)), TileTensor(w, row_major(N * K)),
-        TileTensor(b, row_major(N if use_bias != 0 else 1)), TileTensor(y, lay),
-        M, K, N, use_bias,
-        # one warp per output element (matmul_kernel): M*N*WARP_SIZE threads.
-        grid_dim=ceildiv(M * N * WARP_SIZE, BLOCK), block_dim=BLOCK,
-    )
+    if M == 1:
+        # decode: memory-bound GEMV, one warp per output element (M*N warps).
+        comptime k = matmul_kernel[type_of(lay)]
+        ctx.enqueue_function[k](
+            TileTensor(x, row_major(M * K)), TileTensor(w, row_major(N * K)),
+            TileTensor(b, row_major(N if use_bias != 0 else 1)), TileTensor(y, lay),
+            M, K, N, use_bias,
+            grid_dim=ceildiv(M * N * WARP_SIZE, BLOCK), block_dim=BLOCK,
+        )
+    else:
+        # prefill: 2D register-tiled GEMM, one warp per (CN-column, TM-token) block,
+        # so each weight is reused across TM tokens and each X value across CN
+        # columns — cutting the dominant X traffic CN-fold (§11 #12). TM=CN=8
+        # measured ~2× a token-only tiling (~210 GFLOP/s) on the M4.
+        comptime TM = 8
+        comptime CN = 8
+        comptime kt = matmul_tiled_kernel[type_of(lay), TM, CN]
+        ctx.enqueue_function[kt](
+            TileTensor(x, row_major(M * K)), TileTensor(w, row_major(N * K)),
+            TileTensor(b, row_major(N if use_bias != 0 else 1)), TileTensor(y, lay),
+            M, K, N, use_bias,
+            grid_dim=ceildiv(ceildiv(N, CN) * ceildiv(M, TM) * WARP_SIZE, BLOCK), block_dim=BLOCK,
+        )
     return y^
 
 def rmsnorm(ctx: DeviceContext, mut x: DevBuf, mut w: DevBuf, T: Int, dim: Int) raises -> DevBuf:
@@ -377,6 +393,17 @@ def embed_tokens(ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], mut emb
         grid_dim=ceildiv(T * H, BLOCK), block_dim=BLOCK,
     )
     return h^
+
+def last_row(ctx: DeviceContext, mut src: DevBuf, T: Int, dim: Int) raises -> DevBuf:
+    """Lift row T-1 (dim elements) of src[T,dim] into a fresh 1×dim buffer."""
+    var y = ctx.enqueue_create_buffer[DType.float32](dim)
+    var lay = row_major(dim)
+    comptime k = slice_row_kernel[type_of(lay)]
+    ctx.enqueue_function[k](
+        TileTensor(src, row_major(T * dim)), TileTensor(y, lay), (T - 1) * dim, dim,
+        grid_dim=ceildiv(dim, BLOCK), block_dim=BLOCK,
+    )
+    return y^
 
 def copy_into(ctx: DeviceContext, mut src: DevBuf, mut dst: DevBuf, dst_offset: Int, n: Int, dst_len: Int) raises:
     var lay = row_major(n)
@@ -442,33 +469,38 @@ def layer_cached(ctx: DeviceContext, mut w: Weights, l: Int, mut h: DevBuf,
     return add(ctx, h2, dn, Tq * H)
 
 def argmax_last(ctx: DeviceContext, mut w: Weights, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> Int:
-    """Final RMSNorm + tied LM head; argmax over the last position's logits."""
-    var hn = rmsnorm(ctx, h, w.final_norm, T, H)
-    var logits = mm(ctx, hn, w.embed, dummy, T, H, VOCAB, 0)
+    """Final RMSNorm + tied LM head; argmax over the last position's logits.
+
+    Only row T-1 feeds the LM head: the VOCAB-wide (151936) head is the largest
+    matmul in the net, so at prefill running it on all T rows and keeping one was
+    the dominant cost (§11 #12). Slice the last hidden row first → one GEMV."""
+    var hl = last_row(ctx, h, T, H)
+    var hn = rmsnorm(ctx, hl, w.final_norm, 1, H)
+    var logits = mm(ctx, hn, w.embed, dummy, 1, H, VOCAB, 0)
     ctx.synchronize()
-    var base = (T - 1) * VOCAB
     var best = -1
     var best_v = Float32(-1.0e30)
     with logits.map_to_host() as m:
-        var mt = TileTensor(m, row_major(T * VOCAB))
+        var mt = TileTensor(m, row_major(VOCAB))
         for i in range(VOCAB):
-            var v = rebind[Scalar[DType.float32]](mt[base + i])
+            var v = rebind[Scalar[DType.float32]](mt[i])
             if v > best_v:
                 best_v = v
                 best = i
     return best
 
 def logits_last(ctx: DeviceContext, mut w: Weights, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> List[Float32]:
-    """Final RMSNorm + tied LM head; returns the last position's logits on host."""
-    var hn = rmsnorm(ctx, h, w.final_norm, T, H)
-    var logits = mm(ctx, hn, w.embed, dummy, T, H, VOCAB, 0)
+    """Final RMSNorm + tied LM head; returns the last position's logits on host.
+    Slices row T-1 before the head so prefill runs it once, not T times (§11 #12)."""
+    var hl = last_row(ctx, h, T, H)
+    var hn = rmsnorm(ctx, hl, w.final_norm, 1, H)
+    var logits = mm(ctx, hn, w.embed, dummy, 1, H, VOCAB, 0)
     ctx.synchronize()
     var out = List[Float32]()
-    var base = (T - 1) * VOCAB
     with logits.map_to_host() as m:
-        var mt = TileTensor(m, row_major(T * VOCAB))
+        var mt = TileTensor(m, row_major(VOCAB))
         for i in range(VOCAB):
-            out.append(rebind[Scalar[DType.float32]](mt[base + i]))
+            out.append(rebind[Scalar[DType.float32]](mt[i]))
     return out^
 
 
