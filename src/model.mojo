@@ -11,6 +11,7 @@ Hardcoded to Qwen2.5-0.5B (ARCHITECTURE.md §2). Verified by the test_*.mojo gat
 """
 
 from std.math import ceildiv, exp
+from std.gpu import WARP_SIZE
 from std.gpu.host import DeviceContext, DeviceBuffer
 from std.memory import memcpy
 from layout import TileTensor, row_major
@@ -305,7 +306,8 @@ def mm(ctx: DeviceContext, mut x: DevBuf, mut w: DevBuf, mut b: DevBuf,
         TileTensor(x, row_major(M * K)), TileTensor(w, row_major(N * K)),
         TileTensor(b, row_major(N if use_bias != 0 else 1)), TileTensor(y, lay),
         M, K, N, use_bias,
-        grid_dim=ceildiv(M * N, BLOCK), block_dim=BLOCK,
+        # one warp per output element (matmul_kernel): M*N*WARP_SIZE threads.
+        grid_dim=ceildiv(M * N * WARP_SIZE, BLOCK), block_dim=BLOCK,
     )
     return y^
 

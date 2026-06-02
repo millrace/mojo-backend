@@ -10,7 +10,8 @@ head_dim 64, RoPE θ=1e6, RMSNorm ε=1e-6.
 """
 
 from std.math import sqrt, exp, log, cos, sin
-from std.gpu import global_idx
+from std.gpu import global_idx, WARP_SIZE
+from std.gpu.primitives.warp import sum as warp_sum
 from std.collections import InlineArray
 from layout import TileTensor, TensorLayout
 
@@ -111,20 +112,33 @@ def matmul_kernel[
     N: Int,
     use_bias: Int,
 ):
+    """Y[M,N] = X[M,K] · W[N,K]ᵀ (+bias). One warp per output element.
+
+    The decode path is memory-bound GEMV (M=1): the cost is streaming the
+    weight matrix W from device memory. The earlier one-thread-per-output
+    kernel had each thread walk a full row W[n*K + k] — so adjacent threads
+    read addresses K apart, uncoalesced, wasting most of the bandwidth. Here a
+    whole warp cooperates on one output: lane L reads W[n*K + L], W[n*K + L+32],
+    … so the 32 lanes touch 32 consecutive words each step (coalesced), then
+    `warp_sum` reduces the per-lane partials. Pure f32 accumulate, same as
+    before, so greedy parity is preserved (§11 #8)."""
     comptime assert X.flat_rank == 1
-    var idx = global_idx.x
-    if idx >= M * N:
+    var out = Int(global_idx.x) // WARP_SIZE     # one warp per output element
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if out >= M * N:
         return
-    var m = idx // N
-    var n = idx % N
+    var m = out // N
+    var n = out % N
     var acc = Float32(0.0)
-    for k in range(K):
+    for k in range(lane, K, WARP_SIZE):
         var xv = rebind[Scalar[DType.float32]](X[m * K + k])
         var wv = rebind[Scalar[DType.float32]](W[n * K + k])
         acc += xv * wv
-    if use_bias != 0:
-        acc += rebind[Scalar[DType.float32]](B[n])
-    Y[m * N + n] = rebind[Y.ElementType](acc)
+    var total = warp_sum(acc)
+    if lane == 0:
+        if use_bias != 0:
+            total += rebind[Scalar[DType.float32]](B[n])
+        Y[m * N + n] = rebind[Y.ElementType](total)
 
 
 def silu_mul_kernel[
