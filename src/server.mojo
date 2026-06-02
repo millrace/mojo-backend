@@ -1,52 +1,87 @@
-"""Minimal OpenAI-compatible HTTP server, pure Mojo on the GPU (ARCHITECTURE.md §6).
+"""OpenAI-compatible HTTP server, pure Mojo on the GPU, over flare (ARCHITECTURE.md §6).
 
-flare (max-backend's HTTP layer) pins Mojo 1.0.0b1, but this engine needs the
-1.0.0b2 nightly's std.gpu API — an unresolved version conflict (§11 #11). And the
-Mojo stdlib has no sockets. So this server talks to libc directly via FFI: a
-single-threaded blocking accept loop that loads the model once and answers
-`POST /v1/chat/completions` and `GET /v1/models`.
+Earlier this engine talked to libc sockets directly because flare pinned Mojo
+1.0.0b1 while the GPU code needs the 1.0.0b2 nightly's std.gpu API (§11 #11).
+That conflict is resolved: the ../flare fork now builds under 1.0.0b2 (one
+systematic fix — `unsafe_from_address=0` → `=Int(0)`, since 1.0.0b2 makes
+`UnsafePointer` non-nullable — plus its `libflare_tls.so` rebuilt from source).
+So we reuse flare's kqueue reactor + Router/Handler/SSE just like ../max-backend,
+but wired to *this* engine's real GPU generation instead of MAX.
 
-Scope: minimal. One request at a time (no streaming/SSE, no concurrency — see
-max-backend §10 #4 for why even flare stays single-worker here). Request parsing
-is a crude last-`"content"` extraction, not a full JSON parser; the response is a
-non-streaming ChatCompletion. Enough to point a client at and get real text.
+Endpoints (each shares the one GPU-resident Session-based decode path):
+    GET  /v1/models
+    POST /v1/chat/completions   (stream + non-stream)
+    POST /v1/responses          (stream + non-stream)  ← what opencode drives
+
+The model (Weights + DeviceContext + tokenizer + chat template) is loaded once
+into a heap `ServerState`; the `Api` flare Handler carries a pointer to it. The
+pointer dodges flare's read-only `serve(self, …)` borrow so generation can take
+`mut w` (the GPU kernels bind mutable buffers). Safe because flare's reactor is
+single-threaded here — one request in flight at a time (max-backend §10 #4).
 
     pixi run serve            # listens on 127.0.0.1:8000
     curl -s localhost:8000/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}]}'
 """
 
-from std.ffi import external_call, c_int
 from std.gpu.host import DeviceContext
+from std.memory import alloc
+
+from flare.prelude import *
+from flare.http import Handler, SseChannel, SseEvent, sse_response
 
 from model import (
-    Weights, load_weights, generate, generate_sample, EOS1, EOS2,
+    Weights, load_weights, EOS1, EOS2,
     Session, new_session, sess_prefill, sess_step, argmax_f, process_logits, sample,
 )
 from tokenizer import Tokenizer, load_tokenizer
 from chat import load_chat_template, render_value, json_escape_str
+from template import Template
 from value import Value
 from json import parse_json, bytes_to_string
 
 comptime TEMPLATE = "assets/qwen2.5-chat-template.jinja"
+comptime MODEL_ID = "qwen2.5-0.5b-instruct"
+comptime PORT = 8000
+
 # minja2 Value tags (value.mojo)
 comptime VBOOL = 2
 comptime VINT = 3
 comptime VFLOAT = 4
+comptime VSTR = 5
 # sampling defaults (generation_config.json) when temperature > 0
 comptime DEF_TOPK = 20
 comptime DEF_TOPP = Float32(0.8)
 comptime DEF_REP = Float32(1.1)
 comptime DEF_MAXNEW = 256
+comptime SEED = UInt64(0x9E3779B97F4A7C15)
 
-comptime PORT_HI = 0x1F        # 8000 = 0x1F40, big-endian
-comptime PORT_LO = 0x40
-comptime SOL_SOCKET = 0xFFFF   # macOS
-comptime SO_REUSEADDR = 0x0004
+# Responses-API ids (opencode / Vercel AI SDK)
+comptime RESP_ID = "resp_millrace"
+comptime MSG_ID = "msg_millrace"
 
 
-def read_text(path: String) raises -> String:
-    with open(path, "r") as f:
-        return f.read()
+# ── Shared model state ───────────────────────────────────────────────────────
+
+
+struct ServerState(Movable):
+    """The one model, loaded once and reached by the (borrowed-self) handler
+    through a pointer so generation can still take `mut w`."""
+
+    var ctx: DeviceContext
+    var w: Weights
+    var tok: Tokenizer
+    var tmpl: Template
+
+    def __init__(out self, var ctx: DeviceContext, var w: Weights,
+                 var tok: Tokenizer, var tmpl: Template):
+        self.ctx = ctx^
+        self.w = w^
+        self.tok = tok^
+        self.tmpl = tmpl^
+
+
+# ── small helpers ────────────────────────────────────────────────────────────
+
 
 def to_bytes(s: String) -> List[UInt8]:
     var out = List[UInt8]()
@@ -81,6 +116,34 @@ def get_bool(req: Value, key: String, default: Bool) -> Bool:
         return o.value().b
     return default
 
+def get_str(req: Value, key: String) -> String:
+    var o = req.map_get(key)
+    if o and o.value().tag == VSTR:
+        return o.value().s
+    return String("")
+
+
+def responses_to_chat(bv: Value) raises -> Optional[Value]:
+    """Map a Responses-API body onto the chat-template's `messages` shape.
+
+    opencode's `@ai-sdk/openai-compatible` provider actually drives
+    /v1/chat/completions, so this endpoint is for direct Responses-API clients.
+    We support the common `input`-as-string form (+ optional top-level
+    `instructions` → system message); array `input` returns None (→ 400). Built
+    by re-emitting JSON and reparsing so we reuse parse_json + render_value
+    rather than constructing minja2 Values by hand."""
+    if bv.map_get("messages"):
+        return bv  # already chat-shaped
+    var inp = bv.map_get("input")
+    if not (inp and inp.value().tag == VSTR):
+        return None
+    var msgs = String('{"messages":[')
+    var instr = get_str(bv, "instructions")
+    if len(instr) > 0:
+        msgs += '{"role":"system","content":"' + json_escape_str(to_bytes(instr)) + '"},'
+    msgs += '{"role":"user","content":"' + json_escape_str(to_bytes(inp.value().s)) + '"}]}'
+    return parse_json(msgs)
+
 
 def complete_utf8_len(b: List[UInt8]) -> Int:
     """Length of the longest prefix of `b` that ends on a UTF-8 char boundary —
@@ -112,46 +175,26 @@ def slice_bytes(b: List[UInt8], start: Int, stop: Int) -> List[UInt8]:
     return out^
 
 
-def http_body(req: String) -> String:
-    """The bytes after the blank line separating HTTP headers from the body."""
-    var idx = req.find("\r\n\r\n")
-    if idx < 0:
-        return String("")
-    var rb = req.as_bytes()
-    var out = String("")
-    for i in range(idx + 4, len(rb)):
-        out += chr(Int(rb[i]))
-    return out^
+# ── generation (buffered: produce the whole completion, then frame it) ───────
 
 
-def send_str(conn: c_int, s: String):
-    var b = s.as_bytes()
-    _ = external_call["send", Int](conn, b.unsafe_ptr(), len(b), c_int(0))
+struct Reply(Movable):
+    var ids: List[Int]      # generated token ids (EOS dropped)
+    var stopped: Bool       # True if generation ended on EOS, False if length cap
 
-def http_response(conn: c_int, body: String):
-    var resp = String("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n")
-    resp += "Content-Length: " + String(len(body.as_bytes())) + "\r\nConnection: close\r\n\r\n" + body
-    send_str(conn, resp)
+    def __init__(out self, var ids: List[Int], stopped: Bool):
+        self.ids = ids^
+        self.stopped = stopped
 
 
-comptime CHUNK_HEAD = '{"id":"chatcmpl-millrace","object":"chat.completion.chunk","choices":[{"index":0,"delta":'
-
-def sse(conn: c_int, data: String):
-    send_str(conn, String("data: ") + data + "\n\n")
-
-def handle_stream(conn: c_int, ctx: DeviceContext, mut w: Weights, tok: Tokenizer,
-                  ids: List[Int], max_new: Int, temp: Float32, top_k: Int, top_p: Float32) raises:
-    """SSE streaming: emit one chat.completion.chunk per UTF-8-complete delta."""
-    send_str(conn, String("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"))
-    send_str(conn, String("Cache-Control: no-cache\r\nConnection: close\r\n\r\n"))
-    sse(conn, CHUNK_HEAD + '{"role":"assistant"},"finish_reason":null}]}')
-
-    var s = new_session(ctx, len(ids) + max_new + 2)
-    var logits = sess_prefill(ctx, w, s, ids)
+def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
+             temp: Float32, top_k: Int, top_p: Float32) raises -> Reply:
+    """Run the GPU decode loop to completion for `ids`, honoring OpenAI knobs."""
+    var sess = new_session(s.ctx, len(ids) + max_new + 2)
+    var logits = sess_prefill(s.ctx, s.w, sess, ids)
     var context = ids.copy()
-    var rng = UInt64(0x9E3779B97F4A7C15)
+    var rng = SEED
     var gen = List[Int]()
-    var sent = 0
     var stopped = False
     while len(gen) < max_new:
         var nxt = (
@@ -163,20 +206,196 @@ def handle_stream(conn: c_int, ctx: DeviceContext, mut w: Weights, tok: Tokenize
             break
         gen.append(nxt)
         context.append(nxt)
-        var full = tok.decode(gen)
-        var clen = complete_utf8_len(full)
-        if clen > sent:
-            var delta = json_escape_str(slice_bytes(full, sent, clen))
-            sse(conn, CHUNK_HEAD + '{"content":"' + delta + '"},"finish_reason":null}]}')
-            sent = clen
         if len(gen) >= max_new:
             break
-        logits = sess_step(ctx, w, s, nxt)
+        logits = sess_step(s.ctx, s.w, sess, nxt)
+    return Reply(gen^, stopped)
 
-    var fin = String("stop") if stopped else String("length")
-    sse(conn, CHUNK_HEAD + '{},"finish_reason":"' + fin + '"}]}')
-    send_str(conn, String("data: [DONE]\n\n"))
-    print("  streamed ", len(gen), " tokens [", fin, "]", sep="")
+
+# ── JSON envelopes ───────────────────────────────────────────────────────────
+
+
+def models_json() -> String:
+    return (
+        '{"object":"list","data":[{"id":"' + MODEL_ID
+        + '","object":"model","created":0,"owned_by":"millrace"}]}'
+    )
+
+def completion_json(content: String, n_prompt: Int, n_gen: Int, finish: String) -> String:
+    return (
+        '{"id":"chatcmpl-millrace","object":"chat.completion","created":0,"model":"'
+        + MODEL_ID + '","choices":[{"index":0,"message":{"role":"assistant","content":"'
+        + content + '"},"finish_reason":"' + finish + '"}],'
+        + '"usage":{"prompt_tokens":' + String(n_prompt)
+        + ',"completion_tokens":' + String(n_gen)
+        + ',"total_tokens":' + String(n_prompt + n_gen) + "}}"
+    )
+
+def chunk_json(delta: String, finish: Bool, fin: String) -> String:
+    var delta_obj = String("{}")
+    var finish_reason = String("null")
+    if finish:
+        finish_reason = '"' + fin + '"'
+    else:
+        delta_obj = '{"content":"' + delta + '"}'
+    return (
+        '{"id":"chatcmpl-millrace","object":"chat.completion.chunk","created":0,"model":"'
+        + MODEL_ID + '","choices":[{"index":0,"delta":' + delta_obj
+        + ',"finish_reason":' + finish_reason + "}]}"
+    )
+
+def output_message_json(content: String, status: String) -> String:
+    return (
+        '{"type":"message","id":"' + MSG_ID + '","status":"' + status
+        + '","role":"assistant","content":[{"type":"output_text","text":"'
+        + content + '","annotations":[]}]}'
+    )
+
+def response_object_json(content: String, status: String, with_output: Bool,
+                         n_prompt: Int, n_gen: Int) -> String:
+    var output = String("[]")
+    if with_output:
+        output = "[" + output_message_json(content, "completed") + "]"
+    return (
+        '{"id":"' + RESP_ID + '","object":"response","created_at":0,"status":"'
+        + status + '","model":"' + MODEL_ID + '","output":' + output
+        + ',"usage":{"input_tokens":' + String(n_prompt)
+        + ',"output_tokens":' + String(n_gen)
+        + ',"total_tokens":' + String(n_prompt + n_gen) + "}}"
+    )
+
+def resp_event(type: String, payload: String) -> SseEvent:
+    # Named SSE frame: an `event:` line plus a matching `"type"` in the JSON
+    # (the Vercel AI SDK switches on the latter). `payload` = fields after type.
+    return SseEvent.named(type, '{"type":"' + type + '",' + payload + "}")
+
+
+# ── UTF-8-safe streaming deltas ──────────────────────────────────────────────
+
+
+def stream_deltas(mut s: ServerState, ids: List[Int]) raises -> List[String]:
+    """Decode `ids` incrementally into JSON-escaped deltas that each end on a
+    UTF-8 char boundary — so a multibyte char split across tokens isn't emitted
+    half-formed. (Buffered: all ids are already generated.)"""
+    var out = List[String]()
+    var prefix = List[Int]()
+    var sent = 0
+    for i in range(len(ids)):
+        prefix.append(ids[i])
+        var full = s.tok.decode(prefix)
+        var clen = complete_utf8_len(full)
+        if clen > sent:
+            out.append(json_escape_str(slice_bytes(full, sent, clen)))
+            sent = clen
+    return out^
+
+
+# ── the flare Handler: one struct, manual routing on method + path ───────────
+
+
+@fieldwise_init
+struct Api(Handler, Copyable, Movable):
+    var st: UnsafePointer[ServerState, MutExternalOrigin]
+
+    def serve(self, req: Request) raises -> Response:
+        ref s = self.st[]
+        var path = req.url
+        var is_post = req.method == Method.POST
+
+        if path == "/" or path == "/health":
+            return ok("millrace ok")
+        if path == "/v1/models":
+            return ok_json(models_json())
+        if is_post and path == "/v1/chat/completions":
+            return self.handle_chat(req)
+        if is_post and path == "/v1/responses":
+            return self.handle_responses(req)
+        return not_found("no route for " + req.method + " " + path)
+
+    def handle_chat(self, req: Request) raises -> Response:
+        ref s = self.st[]
+        var body = req.text()
+        var bv = parse_json(body)
+        var ids = s.tok.encode(to_bytes(render_value(s.tmpl, bv)))
+        var max_new = get_int(bv, "max_tokens", DEF_MAXNEW)
+        var temp = Float32(get_float(bv, "temperature", 0.0))
+        var top_p = Float32(get_float(bv, "top_p", Float64(DEF_TOPP)))
+        var top_k = get_int(bv, "top_k", DEF_TOPK)
+        var want_stream = get_bool(bv, "stream", False)
+
+        var r = gen_full(s, ids, max_new, temp, top_k, top_p)
+        var fin = String("stop") if r.stopped else String("length")
+        print("  chat: ", len(r.ids), " tokens [", fin, "]", sep="")
+
+        if want_stream:
+            var ch = SseChannel()
+            var deltas = stream_deltas(s, r.ids)
+            for i in range(len(deltas)):
+                ch.push(SseEvent.message(chunk_json(deltas[i], False, fin)))
+            ch.push(SseEvent.message(chunk_json("", True, fin)))
+            ch.push(SseEvent.message("[DONE]"))
+            ch.close()
+            return sse_response(ch)
+
+        var content = json_escape_str(s.tok.decode(r.ids))
+        return ok_json(completion_json(content, len(ids), len(r.ids), fin))
+
+    def handle_responses(self, req: Request) raises -> Response:
+        ref s = self.st[]
+        var body = req.text()
+        var bv0 = parse_json(body)
+        var chat = responses_to_chat(bv0)
+        if not chat:
+            return bad_request('{"error":{"message":"responses: need messages or string input"}}')
+        var bv = chat.value()
+        var ids = s.tok.encode(to_bytes(render_value(s.tmpl, bv)))
+        # Generation knobs live on the original Responses body, not the
+        # synthesized messages Value. (`max_output_tokens` is the Responses
+        # spelling; fall back to `max_tokens`.)
+        var max_new = get_int(bv0, "max_output_tokens", get_int(bv0, "max_tokens", DEF_MAXNEW))
+        var temp = Float32(get_float(bv0, "temperature", 0.0))
+        var top_p = Float32(get_float(bv0, "top_p", Float64(DEF_TOPP)))
+        var top_k = get_int(bv0, "top_k", DEF_TOPK)
+        var want_stream = get_bool(bv0, "stream", False)
+
+        var r = gen_full(s, ids, max_new, temp, top_k, top_p)
+        var full = json_escape_str(s.tok.decode(r.ids))
+        print("  responses: ", len(r.ids), " tokens", sep="")
+
+        if not want_stream:
+            return ok_json(response_object_json(full, "completed", True, len(ids), len(r.ids)))
+
+        var ch = SseChannel()
+        ch.push(resp_event("response.created",
+            '"response":' + response_object_json("", "in_progress", False, len(ids), 0)))
+        ch.push(resp_event("response.output_item.added",
+            '"output_index":0,"item":{"type":"message","id":"' + MSG_ID
+            + '","status":"in_progress","role":"assistant","content":[]}'))
+        ch.push(resp_event("response.content_part.added",
+            '"item_id":"' + MSG_ID
+            + '","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[]}'))
+        var deltas = stream_deltas(s, r.ids)
+        for i in range(len(deltas)):
+            ch.push(resp_event("response.output_text.delta",
+                '"item_id":"' + MSG_ID
+                + '","output_index":0,"content_index":0,"delta":"' + deltas[i] + '"'))
+        ch.push(resp_event("response.output_text.done",
+            '"item_id":"' + MSG_ID + '","output_index":0,"content_index":0,"text":"' + full + '"'))
+        ch.push(resp_event("response.content_part.done",
+            '"item_id":"' + MSG_ID
+            + '","output_index":0,"content_index":0,"part":{"type":"output_text","text":"'
+            + full + '","annotations":[]}'))
+        ch.push(resp_event("response.output_item.done",
+            '"output_index":0,"item":' + output_message_json(full, "completed")))
+        ch.push(resp_event("response.completed",
+            '"response":' + response_object_json(full, "completed", True, len(ids), len(r.ids))))
+        ch.close()
+        return sse_response(ch)
+
+
+def read_text(path: String) raises -> String:
+    with open(path, "r") as f:
+        return f.read()
 
 
 def main() raises:
@@ -187,75 +406,14 @@ def main() raises:
     var ctx = DeviceContext()
     var w = load_weights(ctx, String(ckpt))
 
-    var fd = external_call["socket", c_int](c_int(2), c_int(1), c_int(0))
-    var one = List[Int32](length=1, fill=1)
-    _ = external_call["setsockopt", c_int](fd, c_int(SOL_SOCKET), c_int(SO_REUSEADDR), one.unsafe_ptr().bitcast[UInt8](), c_int(4))
-    var sa = List[UInt8](length=16, fill=0)
-    sa[0] = 2
-    sa[2] = PORT_HI
-    sa[3] = PORT_LO
-    sa[4] = 127
-    sa[7] = 1
-    if Int(external_call["bind", c_int](fd, sa.unsafe_ptr(), c_int(16))) < 0:
-        raise Error("bind failed (port 8000 in use?)")
-    _ = external_call["listen", c_int](fd, c_int(16))
-    print("millrace serving on http://127.0.0.1:8000  (POST /v1/chat/completions)")
+    var state = ServerState(ctx^, w^, tok^, tmpl^)
+    var sp = alloc[ServerState](1)
+    sp.init_pointee_move(state^)
+    var api = Api(sp)
 
-    while True:
-        var peer = List[UInt8](length=16, fill=0)
-        var plen = List[Int32](length=1, fill=16)
-        var conn = external_call["accept", c_int](fd, peer.unsafe_ptr(), plen.unsafe_ptr().bitcast[UInt8]())
-        if Int(conn) < 0:
-            continue
-        var buf = List[UInt8](length=65536, fill=0)
-        var n = external_call["recv", Int](conn, buf.unsafe_ptr(), 65536, c_int(0))
-        var req = String("")
-        for i in range(Int(n)):
-            req += chr(Int(buf[i]))
-
-        if req.find("/v1/models") >= 0 and req.find("GET") >= 0:
-            http_response(conn, String('{"object":"list","data":[{"id":"qwen2.5-0.5b-instruct","object":"model","owned_by":"millrace"}]}'))
-        else:
-            try:
-                var body_v = parse_json(http_body(req))
-                var ids = tok.encode(to_bytes(render_value(tmpl, body_v)))
-
-                # OpenAI request knobs: greedy unless temperature > 0.
-                var max_new = get_int(body_v, "max_tokens", DEF_MAXNEW)
-                var temp = Float32(get_float(body_v, "temperature", 0.0))
-                var top_p = Float32(get_float(body_v, "top_p", Float64(DEF_TOPP)))
-                var top_k = get_int(body_v, "top_k", DEF_TOPK)
-
-                if get_bool(body_v, "stream", False):
-                    handle_stream(conn, ctx, w, tok, ids, max_new, temp, top_k, top_p)
-                    _ = external_call["close", c_int](conn)
-                    continue
-
-                var gen: List[Int]
-                if temp > 0.0:
-                    gen = generate_sample(ctx, w, ids, max_new, temp, top_k, top_p, DEF_REP, UInt64(0))
-                else:
-                    gen = generate(ctx, w, ids, max_new)
-
-                var body_ids = List[Int]()
-                var stopped = False
-                for i in range(len(gen)):
-                    if gen[i] == EOS1 or gen[i] == EOS2:
-                        stopped = True
-                        break
-                    body_ids.append(gen[i])
-                var dec = tok.decode(body_ids)
-                print("  reply:  ", bytes_to_string(dec), sep="")
-                var finish = String("stop") if stopped else String("length")
-                var json = String('{"id":"chatcmpl-millrace","object":"chat.completion","model":"qwen2.5-0.5b-instruct",')
-                json += '"choices":[{"index":0,"message":{"role":"assistant","content":"'
-                json += json_escape_str(dec)
-                json += '"},"finish_reason":"' + finish + '"}],'
-                json += '"usage":{"prompt_tokens":' + String(len(ids))
-                json += ',"completion_tokens":' + String(len(body_ids))
-                json += ',"total_tokens":' + String(len(ids) + len(body_ids)) + "}}"
-                http_response(conn, json)
-            except e:
-                print("  error: ", String(e), sep="")
-                http_response(conn, String('{"error":{"message":"') + json_escape_str(to_bytes(String(e))) + '"}}')
-        _ = external_call["close", c_int](conn)
+    print("millrace serving on http://127.0.0.1:", PORT, "  (flare)", sep="")
+    print("  GET  /v1/models")
+    print("  POST /v1/chat/completions  (stream + non-stream)")
+    print("  POST /v1/responses         (stream + non-stream)")
+    var srv = HttpServer.bind(SocketAddr.localhost(UInt16(PORT)))
+    srv.serve(api^)

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "millrace/qwen2.5-0.5b-instruct",
+  "provider": {
+    "millrace": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "millrace (local)",
+      "options": {
+        "baseURL": "http://127.0.0.1:8000/v1",
+        "apiKey": "millrace"
+      },
+      "models": {
+        "qwen2.5-0.5b-instruct": { "name": "qwen2.5-0.5b-instruct" }
+      }
+    }
+  }
+}

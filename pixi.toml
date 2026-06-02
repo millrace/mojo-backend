@@ -73,10 +73,21 @@ test-sample = "mojo run src/test_sample.mojo"
 # tables) + a checkpoint path ($QWEN_SAFETENSORS or forward-capture's meta).
 chat = { cmd = "mkdir -p build && mojo build src/main.mojo -I ../minja2/src -o build/chat && ./build/chat" }
 
-# Phase 6b minimal OpenAI-compatible HTTP server, pure Mojo via libc sockets (no
-# flare — it needs Mojo 1.0.0b1; §11 #11). Listens on 127.0.0.1:8000.
-# -I ../minja2/src: chat-template rendering (§5.3).
-serve = { cmd = "mkdir -p build && mojo build src/server.mojo -I ../minja2/src -o build/server && ./build/server" }
+# Phase 6b OpenAI-compatible HTTP server, pure Mojo on the GPU over flare.
+# Listens on 127.0.0.1:8000. -I ../minja2/src: chat templating (§5.3). -I ../flare:
+# the kqueue reactor / Router / SSE, reused from max-backend (§11 #11 — the fork
+# now builds under 1.0.0b2). flare-tls builds libflare_tls.so (raw socket I/O +
+# TLS FFI) from the fork's own C++ source against the env's OpenSSL; flare dlopens
+# it from build/ at runtime.
+flare-tls = { cmd = "mkdir -p build && clang++ -O2 -std=c++17 -fPIC -DNDEBUG -shared -o build/libflare_tls.so ../flare/flare/tls/ffi/openssl_wrapper.cpp -I$CONDA_PREFIX/include -L$CONDA_PREFIX/lib -lssl -lcrypto -Wl,-rpath,$CONDA_PREFIX/lib" }
+serve = { cmd = "mkdir -p build && mojo build src/server.mojo -I ../minja2/src -I ../flare -o build/server && ./build/server", depends-on = ["flare-tls"] }
+
+# Launch opencode pointed at the running service. Start `pixi run serve` first
+# (in another terminal). assets/opencode.json declares a `millrace` provider via
+# @ai-sdk/openai-compatible — which drives /v1/chat/completions — so the local
+# model shows in opencode's picker (its bundled models.dev catalog can't list a
+# local id). Usage: pixi run opencode  (interactive) or  pixi run opencode -- run "prompt".
+opencode = { cmd = "OPENCODE_CONFIG=$PIXI_PROJECT_ROOT/assets/opencode.json OPENAI_BASE_URL=http://127.0.0.1:8000/v1 OPENAI_API_KEY=millrace opencode" }
 
 [feature.oracle.tasks]
 # Generates tests/fixtures/attention/{synthetic,real_L0,real_L23}/ : q/k/v.bin,

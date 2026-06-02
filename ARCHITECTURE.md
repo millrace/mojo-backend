@@ -69,9 +69,10 @@ forward pass on Metal is expected to be coherent where driving MAX's was not.
 ### Non-goals (v1)
 
 - Anthropic `/v1/messages`, multi-request concurrency. *(An OpenAI
-  `/v1/chat/completions` + `/v1/models` server landed in Phase 6 — via libc
-  sockets, since flare needs an incompatible Mojo (§11 #11) — with request params
-  and SSE streaming. It stays single-threaded; the richer surface is future work.)*
+  `/v1/chat/completions` + `/v1/responses` + `/v1/models` server landed in
+  Phase 6 on flare (the fork bumped to 1.0.0b2, §11 #11), with request params,
+  `usage`, SSE streaming, and opencode integration. It stays single-threaded;
+  the richer surface is future work.)*
 - Multiple model architectures / config-driven generality.
 - A production **CPU** compute path. CPU is the conformance oracle only; the
   engine runs on the GPU.
@@ -288,7 +289,7 @@ positions), so it is verifiable in isolation with no other component built.
 | **3 — Forward pass** *(✅ done)* | embed → 24 layers → final norm → tied head on GPU/f32, real weights loaded from safetensors. **Greedy next-token argmax agrees with HF/CPU** (785, `'The'`); per-layer hidden drift ≤ 2.5e-3 over 24 layers (pure f32 accumulation). Per-layer comparison gives the layer-bisection (max-backend §8 #2 rung 6). See §11 #7. |
 | **4 — Decode loop + KV cache** *(✅ done)* | Prefill + incremental greedy decode on-device (per-layer KV cache, RoPE-by-cache-row so a step is O(positions)), EOS handling. **Token-for-token greedy parity with HF**: "What is the capital of France?" → `The capital of France is Paris.` + EOS, all 8 ids identical. See §11 #8. |
 | **5 — Sampling** *(✅ done)* | repetition-penalty → temperature → top-k → top-p → softmax per `generation_config.json`, then seeded multinomial draw (§5.6). Distribution verified vs HF's logits processors (max prob diff ≤ 6e-8). See §11 #9. |
-| **6 — Serve** *(✅ done, deviation)* | A **pure-Mojo, GPU** OpenAI-compatible HTTP server — but via **libc sockets (FFI), not flare**: flare pins Mojo 1.0.0b1 and the GPU engine needs the 1.0.0b2 nightly, and the stdlib has no sockets (§11 #11). `pixi run serve` answers `GET /v1/models` and `POST /v1/chat/completions` with real generated text. Minimal: single-threaded, non-streaming, crude request parse. **End to end, no Python/MAX at runtime.** |
+| **6 — Serve** *(✅ done)* | A **pure-Mojo, GPU** OpenAI-compatible HTTP server on **flare** (the `../flare` fork, bumped to the 1.0.0b2 nightly — §11 #11), reusing its kqueue reactor / `Router` / SSE just like max-backend. `pixi run serve` answers `GET /v1/models`, `POST /v1/chat/completions`, and `POST /v1/responses` (stream + non-stream) with real generated text, honoring OpenAI request params + `usage`. `pixi run opencode` points opencode at it (it drives chat completions). Single-threaded (no concurrency). **End to end, no Python/MAX at runtime.** |
 | **Later — bf16 GPU** | bf16-native device compute (§4) once it matches the f32 reference. |
 | **Later — Generalize** | Replace the hardcoded constants with a parsed `config.json` + a weight-name scheme; add a second architecture. The hardcoding in §2 is the seam this phase widens. |
 
@@ -502,34 +503,52 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
     engine as an application. (Now renders the real chat template via ../minja2,
     §5.3 — the hardcoded template it shipped with was replaced.)
 
-11. **OpenAI-compatible HTTP server works — via libc sockets, not flare (Phase
-    6b, ✅ with a deviation).** The plan was to port max-backend's flare HTTP
-    layer, but **flare pins Mojo `==1.0.0b1`** while this engine requires the
-    `1.0.0b2` nightly's `std.gpu`/`TileTensor` API — downgrading would break the
-    verified GPU kernels — and Mojo's stdlib has **no socket module**. So
-    `src/server.mojo` talks to libc directly (`socket`/`bind`/`listen`/`accept`/
-    `recv`/`send` via `external_call`): a single-threaded blocking accept loop
-    that loads the model once and answers `GET /v1/models` and
-    `POST /v1/chat/completions` with real ChatCompletion JSON. Verified live:
-    "What is the capital of France?" → `The capital of France is Paris.`
-    It parses the request body with minja2's `parse_json` and **honors OpenAI
-    request params**: full `messages` history + `tools` (§5.3), `max_tokens`
-    (→ `finish_reason` `stop`/`length`), and `temperature`/`top_p`/`top_k` —
-    greedy when `temperature` is absent or 0, else the Phase-5 sampler (§11 #9).
-    Responses carry a `usage` block (prompt/completion/total tokens). Output is
-    assembled at the **byte level** so multibyte UTF-8 survives (e.g. "Café
-    Rétro", "Pâte feuille") — building strings with `chr(byte)` per byte
-    mojibakes non-ASCII; `chat.json_escape_str` + `bytes_to_string` fix it.
-    **SSE streaming** (`stream:true`) emits one `chat.completion.chunk` per token
-    (role chunk → content deltas → `finish_reason` → `[DONE]`), with UTF-8-complete
-    delta boundaries so a multibyte char is never split mid-chunk
-    (`complete_utf8_len`). The decode loop is factored into a `Session` (KV caches
-    + position) in model.mojo — `sess_prefill`/`sess_step` — shared by greedy,
-    sampled, and streaming generation (greedy parity gate still passes). **The
-    whole path — socket → tokenizer → GPU model → tokenizer → JSON — is pure Mojo
-    with no Python and no MAX at runtime.** Still single-threaded (no concurrency).
-    `pixi run serve`. Re-port to flare if/when it supports a Mojo that also runs
-    the GPU engine.
+11. **OpenAI-compatible HTTP server works — now on flare, the version conflict
+    resolved (Phase 6b, ✅).** The server began on raw libc sockets because
+    **flare pinned Mojo `==1.0.0b1`** while this engine needs the `1.0.0b2`
+    nightly's `std.gpu`/`TileTensor` API. That conflict is now **fixed in the
+    `../flare` fork (millrace/flare)**, so `src/server.mojo` reuses flare's
+    kqueue reactor + `Router`/`Handler`/SSE — the same layer max-backend uses —
+    wired to *this* engine's GPU generation instead of MAX. The bump was small:
+    1.0.0b2 makes `UnsafePointer` **non-nullable**, so flare's 19
+    `UnsafePointer[…](unsafe_from_address=0)` null-pointer constructions failed a
+    comptime constraint; a literal `0` is rejected but a runtime `Int(0)` is not,
+    so the fix is mechanical (`=0` → `=Int(0)`). flare also dlopens a native
+    `libflare_tls.so` (it hosts not just TLS but the raw-socket `flare_read`/
+    `flare_write` used on *all* I/O, a Mojo `external_call` ABI workaround), which
+    a source-level `-I ../flare` build doesn't produce — so the `flare-tls` pixi
+    task rebuilds it from the fork's own `openssl_wrapper.cpp` against the env's
+    OpenSSL into `build/`. The engine consumes flare locally via `-I ../flare`
+    (like minja2), not as a conda/git dep — no Mojo-version lockstep.
+    The handler is one `Api(Handler)` struct doing manual method+path routing; it
+    carries an `UnsafePointer[ServerState]` to the heap-loaded model so flare's
+    read-only `serve(self,…)` borrow can still reach `mut Weights` (the GPU
+    kernels bind mutable buffers) — safe because the reactor is single-threaded
+    (one request in flight). Endpoints: `GET /v1/models`, `POST /v1/chat/completions`,
+    and `POST /v1/responses` (OpenAI Responses API). It parses bodies with minja2's
+    `parse_json` and **honors OpenAI request params**: full `messages` history +
+    `tools` (§5.3), `max_tokens`/`max_output_tokens` (→ `finish_reason`
+    `stop`/`length`), and `temperature`/`top_p`/`top_k` — greedy when `temperature`
+    is absent or 0, else the Phase-5 sampler (§11 #9). Responses carry a `usage`
+    block. Output is assembled at the **byte level** so multibyte UTF-8 survives
+    (`chat.json_escape_str` + `bytes_to_string`; `chr(byte)` per byte mojibakes).
+    **SSE streaming** (`stream:true`) emits per-token chunks via flare's
+    `SseChannel` — chat: `chat.completion.chunk` → `[DONE]`; responses: the
+    named-event sequence ending `response.completed` — with UTF-8-complete delta
+    boundaries (`complete_utf8_len`) so a multibyte char is never split. Streaming
+    is currently **buffered** (the full completion is generated, then framed and
+    pushed); real-time token-by-token streaming would use a lazy `ChunkSource`
+    (follow-up). The decode loop is factored into a `Session` (KV caches +
+    position) in model.mojo — `sess_prefill`/`sess_step` — shared by greedy,
+    sampled, and streaming (greedy parity gate still passes). **opencode
+    integration:** `assets/opencode.json` declares a `millrace` provider via
+    `@ai-sdk/openai-compatible`; `pixi run opencode` points opencode at the
+    running service. Empirically opencode drives **`/v1/chat/completions`** (not
+    `/v1/responses` as max-backend's note guessed — that provider uses chat
+    completions); verified live, opencode's request hit the chat endpoint and got
+    a real completion. **The whole path — flare → tokenizer → GPU model →
+    tokenizer → JSON — is pure Mojo, no Python and no MAX at runtime.** Still
+    single-threaded (no concurrency; max-backend §10 #4).
 
 ## 12. Code layout
 
