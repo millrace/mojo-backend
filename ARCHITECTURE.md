@@ -550,6 +550,30 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
     tokenizer → JSON — is pure Mojo, no Python and no MAX at runtime.** Still
     single-threaded (no concurrency; max-backend §10 #4).
 
+12. **Decode performance: coalesced GEMV + a profiling-driven diagnosis.** The
+    kernels were correctness-first (§6); first measured decode was **~11 tok/s**
+    (128-tok request). The matmul was one-thread-per-output, each thread walking
+    a full weight row `W[n*K+k]` — so a warp's 32 threads read addresses `K`
+    apart (uncoalesced) and each output's `K`-length dot product ran serially on
+    one thread. Replaced with a **warp-per-output GEMV** (lane `L` strides
+    `W[n*K + L + 32j]` → coalesced; `warp_sum` reduces), launching
+    `M*N*WARP_SIZE` threads. Greedy parity + kernels gates still pass; decode
+    **~11 → ~13.6 tok/s**. A microbench (`.scratch/bench_decode.mojo`, GPU
+    `perf_counter_ns`) then localized the rest: per decode step **~41 ms** at
+    short context, of which the **logits matmul is ~6 ms** (M=1·K=896·N=151936,
+    ≈90 GB/s) and the **24 layers ≈35 ms**. Crucially the step does ~1 GFLOP and
+    streams ~2 GB of f32 weights, so at 41 ms it runs at ~25 GFLOP/s / ~50 GB/s —
+    **neither compute- nor bandwidth-bound, but bound by the long serial chain of
+    ~300 small dependent kernel dispatches** (buffer alloc is only ~3 µs/op;
+    bf16 weights would not help much at 50 GB/s). Confirmed negatively: fusing
+    the two per-layer residual `add`s into the matmul epilogue removed 48
+    launches/token but moved decode 0% (the cheap elementwise ops weren't on the
+    critical path) — so that change was reverted. **The real lever is fewer,
+    bigger *matmul* dispatches:** fuse Q/K/V into one projection and gate/up into
+    one (concatenated weights at load), and/or a fused-attention / fused-MLP
+    megakernel — layout-aware work (the fused QKV output interleaves per token,
+    so prefill attention indexing must follow), deferred as the next perf phase.
+
 ## 12. Code layout
 
 The inference engine is a small Mojo library under `src/`; the `test_*.mojo`
