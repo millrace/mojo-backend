@@ -612,12 +612,24 @@ Run on this machine (osx-arm64, Apple M4, Mojo 1.0.0b2 nightly).
     `rope_q_kernel` so the kernel is transcendental-free (0.64→0.10 ms @128, and
     now **flat in context**: 0.098 ms @256). Gates still pass.
     **Net: server decode ~11 → ~22.6 tok/s @128, 23.9 @256; long context no
-    longer degrades.** The dominant remaining decode cost is now the per-layer
-    MLP matmuls (gate/up/down at INTER=4864, ~0.19 ms each, ~90 GB/s) plus the
-    lm-head — so lever (1) above (vectorized loads / **bf16-resident weights** to
-    halve the ~90 GB/s traffic, numerically identical since weights are bf16-
-    origin) is the next concrete step; the per-layer megakernel (2) remains the
-    bigger structural effort.
+    longer degrades.**
+
+    **bf16-resident weights (done, +~15%).** With attention/RMSNorm fixed the
+    matmuls became the dominant cost (gate/up/down + lm-head, ~90 GB/s — bandwidth
+    bound on weight reads). Weights are bf16 in the checkpoint but were widened to
+    f32 at load, doubling both weight memory and the bytes each matmul streams.
+    They now live on-device as raw bf16 (u16) and are widened per element inside
+    the matmul/embed kernels (`bf16_widen`: `bits<<16`, exact). Numerically
+    identical (same bf16 values, f32 accumulate) — greedy parity holds. Weight
+    memory ~1 GB → ~0.5 GB; logits matmul ~halved; **server decode 22.6 → 25.9
+    tok/s @128, 27.0 @256.** (Test fixtures for the synthetic matmul/SwiGLU were
+    regenerated from bf16 weights so the unit gate matches the kernel; real
+    fixtures are already bf16-origin.)
+
+    Cumulative this phase: **~11 → ~26 tok/s @128 (~2.4x)**, and long context now
+    *improves* per-token (27 @256). Remaining levers: vectorized (`float4`)
+    matmul loads for more bandwidth, and the per-layer megakernel (collapse the
+    ~10-deep dependent-dispatch chain) — both larger structural efforts.
 
 ## 12. Code layout
 
