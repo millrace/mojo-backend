@@ -650,6 +650,22 @@ def sess_prefill(ctx: DeviceContext, mut w: Weights, mut s: Session, prompt: Lis
     return logits_last(ctx, w, h, P, s.dummy)
 
 
+def sess_prefill_suffix(ctx: DeviceContext, mut w: Weights, mut s: Session,
+                        suffix: List[Int], offset: Int) raises -> List[Float32]:
+    """Prefill `suffix` tokens at cache position `offset`, reusing the K/V already
+    stored in rows [0, offset). Returns the last-row logits. This is the engine
+    behind the server's cross-request prefix cache; `sess_prefill` is just the
+    offset==0 / whole-prompt special case. RoPE positions come from `offset`, so
+    the rotated K and the attention mask stay correct for the reused prefix."""
+    var Q = len(suffix)
+    var ids_dev = upload_ids(ctx, suffix)
+    var h = embed_tokens(ctx, ids_dev, w.embed, Q)
+    for l in range(NLAYERS):
+        h = layer_cached(ctx, w, l, h, s.kcs[l], s.vcs[l], Q, offset, s.cache_len, s.dummy)
+    s.pos = offset + Q
+    return logits_last(ctx, w, h, Q, s.dummy)
+
+
 def sess_step(ctx: DeviceContext, mut w: Weights, mut s: Session, token: Int) raises -> List[Float32]:
     var one = upload_ids(ctx, [token])
     var h = embed_tokens(ctx, one, w.embed, 1)

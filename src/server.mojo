@@ -25,13 +25,15 @@ single-threaded here — one request in flight at a time (max-backend §10 #4).
 
 from std.gpu.host import DeviceContext
 from std.memory import alloc
+from std.time import perf_counter_ns
 
 from flare.prelude import *
 from flare.http import Handler, SseChannel, SseEvent, sse_response
 
 from model import (
     Weights, load_weights, EOS1, EOS2,
-    Session, new_session, sess_prefill, sess_step, argmax_f, process_logits, sample,
+    Session, new_session, sess_prefill_suffix, sess_step,
+    argmax_f, process_logits, sample,
 )
 from tokenizer import Tokenizer, load_tokenizer
 from chat import load_chat_template, render_value, json_escape_str
@@ -39,6 +41,12 @@ from toolcall import parse_tool_calls, ToolCall
 from template import Template
 from value import Value
 from json import parse_json, bytes_to_string
+
+# Persistent KV-cache capacity (tokens). One Session of this size lives on
+# ServerState for the whole process so successive requests in an agent loop reuse
+# the prefix they share instead of re-prefilling it. 32768 = Qwen2.5's native
+# context; the cache is ~MAX_SEQ * 24 KiB ≈ 805 MB resident on the GPU.
+comptime MAX_SEQ = 32768
 
 comptime TEMPLATE = "assets/qwen2.5-chat-template.jinja"
 comptime MODEL_ID = "qwen2.5-0.5b-instruct"
@@ -72,13 +80,17 @@ struct ServerState(Movable):
     var w: Weights
     var tok: Tokenizer
     var tmpl: Template
+    var sess: Session      # one long-lived KV cache, reused across requests
+    var cached: List[Int]  # token ids currently held in sess rows [0, len)
 
     def __init__(out self, var ctx: DeviceContext, var w: Weights,
-                 var tok: Tokenizer, var tmpl: Template):
+                 var tok: Tokenizer, var tmpl: Template, var sess: Session):
         self.ctx = ctx^
         self.w = w^
         self.tok = tok^
         self.tmpl = tmpl^
+        self.sess = sess^
+        self.cached = List[Int]()
 
 
 # ── small helpers ────────────────────────────────────────────────────────────
@@ -206,14 +218,43 @@ struct Reply(Movable):
 
 def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
              temp: Float32, top_k: Int, top_p: Float32) raises -> Reply:
-    """Run the GPU decode loop to completion for `ids`, honoring OpenAI knobs."""
-    var sess = new_session(s.ctx, len(ids) + max_new + 2)
-    var logits = sess_prefill(s.ctx, s.w, sess, ids)
+    """Run the GPU decode loop to completion for `ids`, honoring OpenAI knobs.
+
+    Reuses the longest prefix already resident in the persistent KV cache (the
+    common case in an agent loop, where each turn appends to the same growing
+    conversation) and only prefills the diverging suffix. Times prefill vs decode
+    separately — each `sess_*` call ends in a device→host logits copy, so the GPU
+    is synced at the boundary — and logs a terse per-request line."""
+    # Clamp generation so prefill + decode never overrun the cache.
+    var room = MAX_SEQ - len(ids) - 1
+    if room < 1:
+        raise Error("prompt of " + String(len(ids)) + " tokens exceeds context "
+                    + String(MAX_SEQ))
+    var cap = max_new if max_new < room else room
+
+    # Longest common prefix with what's cached; always recompute the last prompt
+    # token so we have its logits to sample the first new token from.
+    var lim = len(s.cached)
+    if len(ids) - 1 < lim:
+        lim = len(ids) - 1
+    var reuse = 0
+    while reuse < lim and s.cached[reuse] == ids[reuse]:
+        reuse += 1
+
+    var suffix = List[Int]()
+    for i in range(reuse, len(ids)):
+        suffix.append(ids[i])
+
+    var t0 = perf_counter_ns()
+    var logits = sess_prefill_suffix(s.ctx, s.w, s.sess, suffix, reuse)
+    var t_pf = perf_counter_ns()
+    s.cached = ids.copy()  # prompt is now resident; generated tokens are not cached
+
     var context = ids.copy()
     var rng = SEED
     var gen = List[Int]()
     var stopped = False
-    while len(gen) < max_new:
+    while len(gen) < cap:
         var nxt = (
             sample(process_logits(logits, context, temp, top_k, top_p, DEF_REP), rng)
             if temp > 0.0 else argmax_f(logits)
@@ -223,9 +264,17 @@ def gen_full(mut s: ServerState, ids: List[Int], max_new: Int,
             break
         gen.append(nxt)
         context.append(nxt)
-        if len(gen) >= max_new:
+        if len(gen) >= cap:
             break
-        logits = sess_step(s.ctx, s.w, sess, nxt)
+        logits = sess_step(s.ctx, s.w, s.sess, nxt)
+    var t_dec = perf_counter_ns()
+
+    var pf_ms = Float64(t_pf - t0) / 1.0e6
+    var dec_ms = Float64(t_dec - t_pf) / 1.0e6
+    var tps = Float64(len(gen)) * 1000.0 / dec_ms if dec_ms > 0.0 else 0.0
+    print("  gen: prompt=", len(ids), "tok (reused ", reuse, ", prefilled ",
+          len(suffix), ")  prefill=", Int(pf_ms + 0.5), "ms  decode=", len(gen),
+          "tok ", Int(dec_ms + 0.5), "ms (", Int(tps + 0.5), " tok/s)", sep="")
     return Reply(gen^, stopped)
 
 
@@ -551,8 +600,9 @@ def main() raises:
     var tmpl = load_chat_template(TEMPLATE)
     var ctx = DeviceContext()
     var w = load_weights(ctx, String(ckpt))
+    var sess = new_session(ctx, MAX_SEQ)  # one persistent KV cache for the process
 
-    var state = ServerState(ctx^, w^, tok^, tmpl^)
+    var state = ServerState(ctx^, w^, tok^, tmpl^, sess^)
     var sp = alloc[ServerState](1)
     sp.init_pointee_move(state^)
     var api = Api(sp)
