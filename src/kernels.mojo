@@ -405,8 +405,9 @@ def attn_cached_kernel[
                 O[obase + c * VEC + e] = rebind[O.ElementType](a / l_g)
 
 
-comptime FLASH_BW = 8           # query warps per block (each shares the staged K/V tile)
+comptime FLASH_PW = 3           # query positions per block (× GROUP heads of one kv-head)
 comptime FLASH_BK = WARP_SIZE   # keys per tile = one per lane
+comptime FLASH_NWARP = FLASH_PW * GROUP   # warps per block = 3 × 7 = 21
 
 
 def flash_attn_kernel[
@@ -425,12 +426,16 @@ def flash_attn_kernel[
     attn_cached_kernel gives each (query, head) its own warp that reads every past
     K/V straight from the cache — fine until the f32 KV working set (≈ pos·128·8 B)
     outgrows the M4 system cache, at which point attention goes DRAM-bound and the
-    cost super-cliffs (measured ~M^3.9 past ~16K tokens). Here a block owns FLASH_BW
-    consecutive query warps of ONE head; they cooperatively stage each FLASH_BK-key
-    tile of K/V into shared memory and all FLASH_BW warps read it from there, so K/V
-    global traffic drops ≈FLASH_BW× and the kernel scales as clean O(M²) — ~2.5×
-    faster at 32K and pulling away (but ~3× slower below the cliff from the staging
-    overhead, so the caller dispatches by context length).
+    cost super-cliffs (measured ~M^3.9 past ~16K tokens). Here a block owns FLASH_PW
+    consecutive query positions × all GROUP query heads of one kv-head — FLASH_NWARP
+    warps that all share the *same* K/V. They cooperatively stage each FLASH_BK-key
+    tile of K/V into shared memory once and every warp reads it from there, so K/V
+    global traffic drops by the full GROUP (head reuse) × FLASH_PW (query reuse) and
+    the kernel scales as clean O(M²) — ~2.5× over attn_cached at 32K (but ~3× slower
+    below the cliff from the staging overhead, so the caller dispatches by context
+    length). Packing all GROUP heads of a kv-head (vs one head per block) is a
+    further ~1.3× over the single-head layout; FLASH_PW=3 (21 warps / 672 threads)
+    is the measured occupancy sweet spot — bigger blocks regress on register pressure.
 
     Lane l still owns keys l, l+FLASH_BK, l+2·FLASH_BK, … in increasing order — the
     exact per-lane sequence and online-softmax update order of attn_cached_kernel —
@@ -439,7 +444,7 @@ def flash_attn_kernel[
     comptime assert Q.flat_rank == 1
     comptime VEC = 8
     comptime NVEC = HEAD_DIM // VEC
-    comptime NTHREAD = FLASH_BW * WARP_SIZE
+    comptime NTHREAD = FLASH_NWARP * WARP_SIZE
     var Ks = stack_allocation[FLASH_BK * HEAD_DIM, Float32, address_space = AddressSpace.SHARED]()
     var Vs = stack_allocation[FLASH_BK * HEAD_DIM, Float32, address_space = AddressSpace.SHARED]()
 
@@ -447,10 +452,12 @@ def flash_attn_kernel[
     var warp = tib // WARP_SIZE
     var lane = tib % WARP_SIZE
     var blk = Int(block_idx.x)
-    var h = blk % HQ
-    var q0 = (blk // HQ) * FLASH_BW
-    var t = q0 + warp
-    var kvh = h // GROUP
+    var kvh = blk % HKV
+    var q0 = (blk // HKV) * FLASH_PW
+    var qi = warp // GROUP          # query position within the tile (0 … FLASH_PW-1)
+    var gi = warp % GROUP           # head within the kv-group (0 … GROUP-1)
+    var t = q0 + qi
+    var h = kvh * GROUP + gi
     var qpos = q_offset + t
     var scale = 1.0 / sqrt(Float32(HEAD_DIM))
     var active = t < Tq
@@ -466,7 +473,7 @@ def flash_attn_kernel[
     var accv = InlineArray[SIMD[DType.float32, VEC], NVEC](fill=0.0)
 
     # Block-uniform key range: every warp runs the same tile count so barriers line up.
-    var t_max = q0 + FLASH_BW - 1
+    var t_max = q0 + FLASH_PW - 1
     if t_max > Tq - 1:
         t_max = Tq - 1
     var kpos_max = q_offset + t_max

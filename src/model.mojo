@@ -19,7 +19,7 @@ from layout import TileTensor, row_major
 from kernels import (
     cvt_kernel, embed_kernel, add_kernel, rmsnorm_kernel, matmul_kernel,
     matmul_tiled_kernel, slice_row_kernel,
-    silu_mul_kernel, attn_cached_kernel, flash_attn_kernel, FLASH_BW,
+    silu_mul_kernel, attn_cached_kernel, flash_attn_kernel, FLASH_PW, FLASH_NWARP,
     copy_kernel, rope_k_kernel, rope_q_kernel,
 )
 
@@ -448,8 +448,9 @@ def attn_cached(ctx: DeviceContext, mut q: DevBuf, mut kc: DevBuf, mut vc: DevBu
         ctx.enqueue_function[kf](
             TileTensor(qr, row_major(Tq * H)), TileTensor(kc, row_major(cache_len)),
             TileTensor(vc, row_major(cache_len)), TileTensor(o, lay), Tq, q_offset,
-            # one block per (query-tile of FLASH_BW, head); FLASH_BW warps each
-            grid_dim=ceildiv(Tq, FLASH_BW) * HQ, block_dim=FLASH_BW * WARP_SIZE,
+            # one block per (query-tile of FLASH_PW, kv-head); FLASH_NWARP warps each
+            # (FLASH_PW queries × GROUP heads sharing the staged K/V)
+            grid_dim=ceildiv(Tq, FLASH_PW) * HKV, block_dim=FLASH_NWARP * WARP_SIZE,
         )
     else:
         comptime k = attn_cached_kernel[type_of(lay)]
