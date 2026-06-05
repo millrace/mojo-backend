@@ -87,6 +87,13 @@ test-blockcache = "mojo run src/test_blockcache.mojo"
 # weights + Metal GPU. Usage: pixi run simd-parity [-- "prompt"].
 simd-parity = { cmd = "mojo build tests/manual/simd_parity.mojo -I src -I ../minja2/src -o build/simd_parity && ./build/simd_parity" }
 
+# int8 quantization eval (shelved investigation, kept for repro). int8-quality:
+# per-channel int8 RTN fake-quant vs bf16 — recon error, teacher-forced top-1 +
+# KL drift, greedy divergence. Needs weights + GPU. int8-gemv-bench: int8 (naive
+# + vectorized int8x4) vs bf16 decode GEMV bandwidth; GPU only, no weights.
+int8-quality = { cmd = "mkdir -p build && mojo build tests/manual/int8_quality.mojo -I src -I ../minja2/src -o build/int8_quality && ./build/int8_quality" }
+int8-gemv-bench = { cmd = "mkdir -p build && mojo build tests/manual/int8_gemv_bench.mojo -I src -o build/int8_gemv_bench && ./build/int8_gemv_bench" }
+
 # Phase 6a end-to-end chat CLI (ARCHITECTURE.md §6): prompt -> text, pure Mojo on
 # the GPU. Usage: pixi run chat -- "Your question". Needs tok-capture (tokenizer
 # tables) + a checkpoint path ($QWEN_SAFETENSORS or forward-capture's meta).
