@@ -334,6 +334,199 @@ def matmul_simd_kernel[
             Y[mm * N + nn] = rebind[Y.ElementType](v)
 
 
+# ── group-128 int4 weights (opt-in, e.g. for the 3B) ──────────────────────────
+# Weight W[N,K] (K a multiple of 128) is stored as symmetric RTN int4 in
+# 128-wide groups along K: packed u32[N*K/8] (8 signed nibbles/word, q+8 ∈ 0..15;
+# the nibble for linear index `lin = n*K+k` sits in word lin>>3 at bit-shift
+# 4*(lin&7)) + scales f32[N*(K/128)]. Dequant = (nibble-8)*scale[n, k/128]. This
+# keeps coherent quality on the 3B (per-channel int4 collapses on weight
+# outliers; 128-groups bound each scale's span — validated ~85% top-1, KL 0.16).
+# Only the W-read changes vs the bf16 kernels; the matmul math (and the
+# simdgroup-matrix path) is identical, so the 4.5× prefill carries over.
+comptime Q4_GROUP = 128
+comptime Q4_SHIFT = 7                  # log2(Q4_GROUP)
+comptime _Q4_SHIFTS = SIMD[DType.uint32, 8](0, 4, 8, 12, 16, 20, 24, 28)
+
+
+@always_inline
+def q4_deq[LT: TensorLayout](
+    P: TileTensor[DType.uint32, LT, MutAnyOrigin],
+    S: TileTensor[DType.float32, LT, MutAnyOrigin],
+    n: Int, k: Int, K: Int, NG: Int,
+) -> Float32:
+    """Dequant a single weight (n,k). Used by the prefill GEMM W-staging, where
+    the matmul (not the dequant) dominates."""
+    comptime assert P.flat_rank == 1
+    var lin = n * K + k
+    var w = Int(rebind[Scalar[DType.uint32]](P[lin >> 3]))
+    var nib = (w >> ((lin & 7) * 4)) & 0xF
+    var s = rebind[Scalar[DType.float32]](S[n * NG + (k >> Q4_SHIFT)])
+    return Float32(nib - 8) * s
+
+
+def matmul_q4_kernel[
+    LT: TensorLayout
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],
+    P: TileTensor[DType.uint32, LT, MutAnyOrigin],
+    S: TileTensor[DType.float32, LT, MutAnyOrigin],
+    B: TileTensor[DType.float32, LT, MutAnyOrigin],
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    M: Int, K: Int, N: Int, NG: Int, use_bias: Int,
+):
+    """Decode GEMV for int4 weights (M=1). Like matmul_kernel, but each lane
+    consumes one u32 (8 weights) per step → coalesced 128-byte loads, and the 8
+    nibbles are unpacked with vector ops (a scalar unpack loop is ~2.5× slower —
+    it makes the kernel ALU-bound, wasting the 4× lower weight traffic). The
+    group scale is folded once per word (a 128-group is a multiple of 8, so an
+    8-aligned word never straddles two groups). ~2× the bf16 GEMV on the M4."""
+    comptime assert X.flat_rank == 1
+    var out = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if out >= M * N:
+        return
+    var m = out // N
+    var n = out % N
+    var words = K // 8
+    var rowword = n * words
+    var xbase = m * K
+    var acc = Float32(0.0)
+    for w in range(lane, words, WARP_SIZE):
+        var packed = rebind[Scalar[DType.uint32]](P[rowword + w])
+        var k0 = w * 8
+        var s = rebind[Scalar[DType.float32]](S[n * NG + (k0 >> Q4_SHIFT)])
+        var nibs = (SIMD[DType.uint32, 8](packed) >> _Q4_SHIFTS) & 0xF
+        var qf = (nibs.cast[DType.int32]() - 8).cast[DType.float32]()
+        var xv = SIMD[DType.float32, 8](0.0)
+        for o in range(8):
+            xv[o] = rebind[Scalar[DType.float32]](X[xbase + k0 + o])
+        acc += (qf * xv).reduce_add() * s
+    var total = warp_sum(acc)
+    if lane == 0:
+        if use_bias != 0:
+            total += rebind[Scalar[DType.float32]](B[n])
+        Y[m * N + n] = rebind[Y.ElementType](total)
+
+
+def matmul_tiled_q4_kernel[
+    LT: TensorLayout, TM: Int, CN: Int
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],
+    P: TileTensor[DType.uint32, LT, MutAnyOrigin],
+    S: TileTensor[DType.float32, LT, MutAnyOrigin],
+    B: TileTensor[DType.float32, LT, MutAnyOrigin],
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    M: Int, K: Int, N: Int, NG: Int, use_bias: Int,
+):
+    """int4 scalar prefill fallback — matmul_tiled_kernel with q4_deq W-reads.
+    Used only if the simdgroup-matrix probe fails."""
+    comptime assert X.flat_rank == 1
+    var ncols = ceildiv(N, CN)
+    var tile = Int(global_idx.x) // WARP_SIZE
+    var lane = Int(global_idx.x) % WARP_SIZE
+    if tile >= ncols * ceildiv(M, TM):
+        return
+    var n0 = (tile % ncols) * CN
+    var m0 = (tile // ncols) * TM
+    var acc = InlineArray[Float32, TM * CN](fill=0.0)
+    for k in range(lane, K, WARP_SIZE):
+        var wv = InlineArray[Float32, CN](fill=0.0)
+        for c in range(CN):
+            if n0 + c < N:
+                wv[c] = q4_deq(P, S, n0 + c, k, K, NG)
+        for mm in range(TM):
+            var m = m0 + mm
+            if m < M:
+                var xv = rebind[Scalar[DType.float32]](X[m * K + k])
+                for c in range(CN):
+                    acc[mm * CN + c] += xv * wv[c]
+    for mm in range(TM):
+        var m = m0 + mm
+        for c in range(CN):
+            var total = warp_sum(acc[mm * CN + c])
+            var n = n0 + c
+            if lane == 0 and m < M and n < N:
+                var bias = Float32(0.0)
+                if use_bias != 0:
+                    bias = rebind[Scalar[DType.float32]](B[n])
+                Y[m * N + n] = rebind[Y.ElementType](total + bias)
+
+
+def matmul_simd_q4_kernel[
+    LT: TensorLayout
+](
+    X: TileTensor[DType.float32, LT, MutAnyOrigin],
+    P: TileTensor[DType.uint32, LT, MutAnyOrigin],
+    S: TileTensor[DType.float32, LT, MutAnyOrigin],
+    B: TileTensor[DType.float32, LT, MutAnyOrigin],
+    Y: TileTensor[DType.float32, LT, MutAnyOrigin],
+    M: Int, K: Int, N: Int, NG: Int, use_bias: Int,
+):
+    """int4 prefill GEMM: matmul_simd_kernel with int4-dequant W-staging. The
+    simdgroup-matrix math is byte-for-byte the bf16 kernel's — only sB is filled
+    from q4_deq instead of bf16_widen — so the ~4.5× prefill speedup carries."""
+    comptime assert X.flat_rank == 1
+    var tid = thread_idx.x
+    var sg = Int(tid) // 32
+    var m0 = Int(block_idx.y) * SG_BM
+    var n0 = Int(block_idx.x) * SG_BN
+
+    var sA = stack_allocation[SG_BM * 8, Float32, address_space = AddressSpace.SHARED]()
+    var sB = stack_allocation[8 * SG_BN, Float32, address_space = AddressSpace.SHARED]()
+    var sC = stack_allocation[SG_BM * SG_BN, Float32, address_space = AddressSpace.SHARED]()
+
+    var dims = _SG_V2(8, 8)
+    var lay8 = _SG_V2(1, 8)
+    var layN = _SG_V2(1, SG_BN)
+    var origin = _SG_V2(0, 0)
+    var acc = InlineArray[_SG_FRAG, SG_NCT](fill=_SG_FRAG(0.0))
+
+    var kt = 0
+    while kt < K:
+        for j in range(SG_BM * 8 // SG_TPB):
+            var c = Int(tid) + SG_TPB * j
+            var r = c // 8
+            var col = c % 8
+            var mm = m0 + r
+            var kk = kt + col
+            var xv = Float32(0.0)
+            if mm < M and kk < K:
+                xv = rebind[Scalar[DType.float32]](X[mm * K + kk])
+            sA[c] = xv
+        for j in range(8 * SG_BN // SG_TPB):
+            var c = Int(tid) + SG_TPB * j
+            var kr = c // SG_BN
+            var nl = c % SG_BN
+            var nn = n0 + nl
+            var kk = kt + kr
+            var wv = Float32(0.0)
+            if nn < N and kk < K:
+                wv = q4_deq(P, S, nn, kk, K, NG)
+            sB[c] = wv
+        barrier()
+        var fa = external_call[_SG_LD, _SG_FRAG](sA + sg * 8 * 8, dims, lay8, origin)
+        for ct in range(SG_NCT):
+            var fb = external_call[_SG_LD, _SG_FRAG](sB + ct * 8, dims, layN, origin)
+            acc[ct] = external_call[_SG_MAC, _SG_FRAG](fa, fb, acc[ct])
+        barrier()
+        kt += 8
+
+    for ct in range(SG_NCT):
+        external_call[_SG_ST, NoneType](acc[ct], sC + sg * 8 * SG_BN + ct * 8, dims, layN, origin)
+    barrier()
+    for j in range(SG_BM * SG_BN // SG_TPB):
+        var c = Int(tid) + SG_TPB * j
+        var r = c // SG_BN
+        var nl = c % SG_BN
+        var mm = m0 + r
+        var nn = n0 + nl
+        if mm < M and nn < N:
+            var v = sC[c]
+            if use_bias != 0:
+                v += rebind[Scalar[DType.float32]](B[nn])
+            Y[mm * N + nn] = rebind[Y.ElementType](v)
+
+
 def silu_mul_kernel[
     LT: TensorLayout
 ](

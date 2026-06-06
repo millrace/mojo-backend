@@ -94,6 +94,19 @@ simd-parity = { cmd = "mojo build tests/manual/simd_parity.mojo -I src -I ../min
 int8-quality = { cmd = "mkdir -p build && mojo build tests/manual/int8_quality.mojo -I src -I ../minja2/src -o build/int8_quality && ./build/int8_quality" }
 int8-gemv-bench = { cmd = "mkdir -p build && mojo build tests/manual/int8_gemv_bench.mojo -I src -o build/int8_gemv_bench && ./build/int8_gemv_bench" }
 
+# group-128 int4 validation (see model.QMat). q4-kernels: int4 GEMV + simd GEMM
+# correctness vs CPU + GEMV-vs-bf16 speed, GPU only (no weights). q4-validate:
+# wired int4 vs bf16 top-1/KL on the real model (needs weights). int4-quality:
+# fake-quant scheme sweep (int8/int4 per-channel/group) vs bf16 (needs weights).
+q4-kernels = { cmd = "mkdir -p build && mojo build tests/manual/q4_kernels.mojo -I src -o build/q4_kernels && ./build/q4_kernels" }
+q4-validate = { cmd = "mkdir -p build && mojo build tests/manual/q4_validate.mojo -I src -I ../minja2/src -o build/q4_validate && ./build/q4_validate" }
+int4-quality = { cmd = "mkdir -p build && mojo build tests/manual/int4_quality.mojo -I src -I ../minja2/src -o build/int4_quality && ./build/int4_quality" }
+
+# Cross-engine benchmark (millrace vs mlx_lm.server vs Ollama): TTFT, decode
+# tok/s, cold/warm prefix. Stdlib python, no GPU build. Start the servers first
+# (bench/README.md), then: pixi run bench [-- --only millrace,mlx --doctor ...].
+bench = { cmd = "python3 bench/bench.py" }
+
 # Phase 6a end-to-end chat CLI (ARCHITECTURE.md §6): prompt -> text, pure Mojo on
 # the GPU. Usage: pixi run chat -- "Your question". Needs tok-capture (tokenizer
 # tables) + a checkpoint path ($QWEN_SAFETENSORS or forward-capture's meta).

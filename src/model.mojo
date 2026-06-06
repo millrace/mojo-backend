@@ -22,6 +22,7 @@ from kernels import (
     matmul_tiled_kernel, matmul_simd_kernel, SG_BM, SG_BN, SG_TPB, slice_row_kernel,
     silu_mul_kernel, attn_cached_kernel, flash_attn_kernel, FLASH_PW,
     copy_kernel, rope_k_kernel, rope_q_kernel,
+    matmul_q4_kernel, matmul_tiled_q4_kernel, matmul_simd_q4_kernel, Q4_GROUP, bf16_widen,
 )
 
 # Above this context length (keys = q_offset + Tq) the f32 KV working set spills
@@ -42,6 +43,30 @@ comptime EOS2 = 151643
 
 comptime DevBuf = DeviceBuffer[DType.float32]
 comptime WBuf = DeviceBuffer[DType.uint16]   # bf16 weights kept on-device as raw u16
+comptime PBuf = DeviceBuffer[DType.uint32]   # packed group-128 int4 weights (8 nibbles/word)
+
+
+struct QMat(Movable):
+    """A projection weight in *either* representation: bf16 (`q4=False`, uses
+    `bf16`) or group-128 int4 (`q4=True`, uses `packed`+`scales`). The unused
+    representation holds a size-1 dummy buffer so the struct stays optional-free.
+    mm() dispatches on `q4`, so the bf16 path is byte-for-byte unchanged and a
+    model can mix (here: bf16 0.5B, int4 3B; either is selectable at load)."""
+    var bf16: WBuf
+    var packed: PBuf
+    var scales: DevBuf
+    var q4: Bool
+
+    def __init__(out self, var bf16: WBuf, var packed: PBuf, var scales: DevBuf, q4: Bool):
+        self.bf16 = bf16^
+        self.packed = packed^
+        self.scales = scales^
+        self.q4 = q4
+
+
+def qmat_bf16(ctx: DeviceContext, var buf: WBuf) raises -> QMat:
+    return QMat(buf^, ctx.enqueue_create_buffer[DType.uint32](1),
+                ctx.enqueue_create_buffer[DType.float32](1), False)
 
 
 # ── safetensors header (JSON subset) ──────────────────────────────────────────
@@ -274,6 +299,66 @@ def load_named_bf16(ctx: DeviceContext, paths: List[String], entries: List[Tenso
     return load_one_bf16(ctx, paths[idx], entries[idx].begin, entries[idx].end)
 
 
+def load_one_q4(ctx: DeviceContext, path: String, begin: Int, end: Int, K: Int) raises -> QMat:
+    """Load a bf16 weight [N,K] (row-major; K = reduction dim, a multiple of 128)
+    and quantize it to group-128 int4 on the host — symmetric RTN, scale per
+    128-wide group along K. Reads the raw bf16 bytes (no full-precision copy ever
+    reaches the device), packs 8 nibbles/u32, uploads packed+scales. One-time at
+    load (host-side, so it is not fast — a few minutes for the 3B)."""
+    var nbytes = end - begin
+    var count = nbytes // 2                    # u16 weights = N*K
+    var N = count // K
+    var NG = K // Q4_GROUP
+    var pcount = count // 8                     # u32 words = N*K/8
+    var packed_host = ctx.enqueue_create_host_buffer[DType.uint32](pcount)
+    var scales_host = ctx.enqueue_create_host_buffer[DType.float32](N * NG)
+    ctx.synchronize()
+    var pp = packed_host.unsafe_ptr()
+    var sp = scales_host.unsafe_ptr()
+    for i in range(pcount):
+        pp[i] = 0
+    with open(path, "r") as f:
+        _ = f.seek(UInt64(begin))
+        var raw = f.read_bytes(nbytes)
+        var u16 = raw.unsafe_ptr().bitcast[UInt16]()    # little-endian bf16 bits
+        for n in range(N):
+            for g in range(NG):
+                var amax = Float32(0.0)
+                for k in range(g * Q4_GROUP, (g + 1) * Q4_GROUP):
+                    var v = bf16_widen(u16[n * K + k])
+                    var a = v if v >= 0.0 else -v
+                    if a > amax:
+                        amax = a
+                var s = amax / 7.0 if amax > 0.0 else Float32(1.0)
+                sp[n * NG + g] = s
+                var inv = 1.0 / s
+                for k in range(g * Q4_GROUP, (g + 1) * Q4_GROUP):
+                    var q = bf16_widen(u16[n * K + k]) * inv
+                    var half = Float32(0.5) if q >= 0.0 else Float32(-0.5)
+                    var qr = Int(q + half)
+                    if qr > 7:
+                        qr = 7
+                    elif qr < -7:
+                        qr = -7
+                    var lin = n * K + k
+                    pp[lin >> 3] = pp[lin >> 3] | (UInt32(qr + 8) << UInt32((lin & 7) * 4))
+    var packed_dev = ctx.enqueue_create_buffer[DType.uint32](pcount)
+    var scales_dev = ctx.enqueue_create_buffer[DType.float32](N * NG)
+    ctx.enqueue_copy(packed_dev, packed_host)
+    ctx.enqueue_copy(scales_dev, scales_host)
+    ctx.synchronize()
+    return QMat(ctx.enqueue_create_buffer[DType.uint16](1), packed_dev^, scales_dev^, True)
+
+
+def load_proj(ctx: DeviceContext, paths: List[String], entries: List[TensorEntry],
+              name2idx: Dict[String, Int], name: String, K: Int, q4: Bool) raises -> QMat:
+    """A projection weight as QMat: int4 (group-128) if `q4` else bf16."""
+    var idx = name2idx[name]
+    if q4:
+        return load_one_q4(ctx, paths[idx], entries[idx].begin, entries[idx].end, K)
+    return qmat_bf16(ctx, load_one_bf16(ctx, paths[idx], entries[idx].begin, entries[idx].end))
+
+
 def _str_bytes(s: String) -> List[UInt8]:
     var out = List[UInt8]()
     var b = s.as_bytes()
@@ -368,17 +453,17 @@ struct Weights(Movable):
     var embed: WBuf            # bf16 — used as both embedding table and (tied) lm-head
     var final_norm: DevBuf
     var ln1: List[DevBuf]
-    var qw: List[WBuf]
+    var qw: List[QMat]
     var qb: List[DevBuf]
-    var kw: List[WBuf]
+    var kw: List[QMat]
     var kb: List[DevBuf]
-    var vw: List[WBuf]
+    var vw: List[QMat]
     var vb: List[DevBuf]
-    var ow: List[WBuf]
+    var ow: List[QMat]
     var ln2: List[DevBuf]
-    var gate: List[WBuf]
-    var up: List[WBuf]
-    var down: List[WBuf]
+    var gate: List[QMat]
+    var up: List[QMat]
+    var down: List[QMat]
     # Architecture dims, auto-detected from the checkpoint (see load_weights).
     # `arch` selects the comptime head-kernel instantiation: 0 = 0.5B, 1 = 3B.
     var arch: Int
@@ -393,6 +478,9 @@ struct Weights(Movable):
     # Set once at startup by probe_simd_gemm: use the simdgroup-matrix GEMM for
     # prefill if this toolchain accepts the AIR intrinsics, else the scalar path.
     var simd_ok: Bool
+    # True if the projection weights (qw/kw/vw/ow/gate/up/down) are group-128 int4;
+    # embed/lm-head stays bf16 either way. Reported in the startup banner.
+    var quant: Bool
 
 
 def _hidden_size(entries: List[TensorEntry], name2idx: Dict[String, Int]) raises -> Int:
@@ -401,7 +489,7 @@ def _hidden_size(entries: List[TensorEntry], name2idx: Dict[String, Int]) raises
     return (entries[idx].end - entries[idx].begin) // 2
 
 
-def load_weights(ctx: DeviceContext, path: String) raises -> Weights:
+def load_weights(ctx: DeviceContext, path: String, q4: Bool = False) raises -> Weights:
     var gathered = gather_tensors(path)
     var entries = gathered[0].copy()
     var paths = gathered[1].copy()
@@ -433,36 +521,38 @@ def load_weights(ctx: DeviceContext, path: String) raises -> Weights:
         )
     var nkv = hkv * head_dim
 
+    # int4 needs K (the reduction dim) to be a multiple of Q4_GROUP; hidden and
+    # inter satisfy this for both supported archs. embed/lm-head stays bf16.
     var embed = load_named_bf16(ctx, paths, entries, name2idx, "model.embed_tokens.weight")
     var final_norm = load_named(ctx, paths, entries, name2idx, "model.norm.weight")
     var ln1 = List[DevBuf]()
-    var qw = List[WBuf]()
+    var qw = List[QMat]()
     var qb = List[DevBuf]()
-    var kw = List[WBuf]()
+    var kw = List[QMat]()
     var kb = List[DevBuf]()
-    var vw = List[WBuf]()
+    var vw = List[QMat]()
     var vb = List[DevBuf]()
-    var ow = List[WBuf]()
+    var ow = List[QMat]()
     var ln2 = List[DevBuf]()
-    var gate = List[WBuf]()
-    var up = List[WBuf]()
-    var down = List[WBuf]()
+    var gate = List[QMat]()
+    var up = List[QMat]()
+    var down = List[QMat]()
     for l in range(nlayers):
         var p = "model.layers." + String(l) + "."
         ln1.append(load_named(ctx, paths, entries, name2idx, p + "input_layernorm.weight"))
-        qw.append(load_named_bf16(ctx, paths, entries, name2idx, p + "self_attn.q_proj.weight"))
+        qw.append(load_proj(ctx, paths, entries, name2idx, p + "self_attn.q_proj.weight", hidden, q4))
         qb.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.q_proj.bias"))
-        kw.append(load_named_bf16(ctx, paths, entries, name2idx, p + "self_attn.k_proj.weight"))
+        kw.append(load_proj(ctx, paths, entries, name2idx, p + "self_attn.k_proj.weight", hidden, q4))
         kb.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.k_proj.bias"))
-        vw.append(load_named_bf16(ctx, paths, entries, name2idx, p + "self_attn.v_proj.weight"))
+        vw.append(load_proj(ctx, paths, entries, name2idx, p + "self_attn.v_proj.weight", hidden, q4))
         vb.append(load_named(ctx, paths, entries, name2idx, p + "self_attn.v_proj.bias"))
-        ow.append(load_named_bf16(ctx, paths, entries, name2idx, p + "self_attn.o_proj.weight"))
+        ow.append(load_proj(ctx, paths, entries, name2idx, p + "self_attn.o_proj.weight", hidden, q4))
         ln2.append(load_named(ctx, paths, entries, name2idx, p + "post_attention_layernorm.weight"))
-        gate.append(load_named_bf16(ctx, paths, entries, name2idx, p + "mlp.gate_proj.weight"))
-        up.append(load_named_bf16(ctx, paths, entries, name2idx, p + "mlp.up_proj.weight"))
-        down.append(load_named_bf16(ctx, paths, entries, name2idx, p + "mlp.down_proj.weight"))
+        gate.append(load_proj(ctx, paths, entries, name2idx, p + "mlp.gate_proj.weight", hidden, q4))
+        up.append(load_proj(ctx, paths, entries, name2idx, p + "mlp.up_proj.weight", hidden, q4))
+        down.append(load_proj(ctx, paths, entries, name2idx, p + "mlp.down_proj.weight", inter, q4))
     return Weights(embed^, final_norm^, ln1^, qw^, qb^, kw^, kb^, vw^, vb^, ow^, ln2^, gate^, up^, down^,
-                   arch, nlayers, hidden, inter, nkv, hq, hkv, head_dim, VOCAB, False)
+                   arch, nlayers, hidden, inter, nkv, hq, hkv, head_dim, VOCAB, False, q4)
 
 
 # ── op launchers (each runs one kernel, returns a new device buffer) ───────────
@@ -507,6 +597,38 @@ def mm(ctx: DeviceContext, mut x: DevBuf, mut w: WBuf, mut b: DevBuf,
             M, K, N, use_bias,
             grid_dim=ceildiv(ceildiv(N, CN) * ceildiv(M, TM) * WARP_SIZE, BLOCK), block_dim=BLOCK,
         )
+    return y^
+
+
+def mm_w(ctx: DeviceContext, mut x: DevBuf, mut w: QMat, mut b: DevBuf,
+         M: Int, K: Int, N: Int, use_bias: Int, simd_ok: Bool = False) raises -> DevBuf:
+    """mm() for a QMat weight: bf16 path (delegates to mm) or group-128 int4. The
+    int4 dispatch mirrors mm — GEMV at M=1 (decode), simdgroup-matrix GEMM at
+    M>1 with the probe on (prefill), scalar-tiled fallback otherwise."""
+    if not w.q4:
+        return mm(ctx, x, w.bf16, b, M, K, N, use_bias, simd_ok)
+    var y = ctx.enqueue_create_buffer[DType.float32](M * N)
+    var lay = row_major(M * N)
+    var NG = K // Q4_GROUP
+    var xt = TileTensor(x, row_major(M * K))
+    var pt = TileTensor(w.packed, row_major(N * K // 8))
+    var st = TileTensor(w.scales, row_major(N * NG))
+    var bt = TileTensor(b, row_major(N if use_bias != 0 else 1))
+    var yt = TileTensor(y, lay)
+    if M == 1:
+        comptime k = matmul_q4_kernel[type_of(lay)]
+        ctx.enqueue_function[k](xt, pt, st, bt, yt, M, K, N, NG, use_bias,
+            grid_dim=ceildiv(M * N * WARP_SIZE, BLOCK), block_dim=BLOCK)
+    elif simd_ok:
+        comptime ks = matmul_simd_q4_kernel[type_of(lay)]
+        ctx.enqueue_function[ks](xt, pt, st, bt, yt, M, K, N, NG, use_bias,
+            grid_dim=(ceildiv(N, SG_BN), ceildiv(M, SG_BM)), block_dim=SG_TPB)
+    else:
+        comptime TM = 8
+        comptime CN = 8
+        comptime kt = matmul_tiled_q4_kernel[type_of(lay), TM, CN]
+        ctx.enqueue_function[kt](xt, pt, st, bt, yt, M, K, N, NG, use_bias,
+            grid_dim=ceildiv(ceildiv(N, CN) * ceildiv(M, TM) * WARP_SIZE, BLOCK), block_dim=BLOCK)
     return y^
 
 def probe_simd_gemm(ctx: DeviceContext) raises -> Bool:
@@ -703,20 +825,20 @@ def layer_cached(ctx: DeviceContext, mut w: Weights, l: Int, mut h: DevBuf,
     var hd = w.hidden
     var nkv = w.nkv
     var ln1 = rmsnorm(ctx, h, w.ln1[l], Tq, hd)
-    var q = mm(ctx, ln1, w.qw[l], w.qb[l], Tq, hd, hd, 1, w.simd_ok)
-    var kk = mm(ctx, ln1, w.kw[l], w.kb[l], Tq, hd, nkv, 1, w.simd_ok)
-    var vv = mm(ctx, ln1, w.vw[l], w.vb[l], Tq, hd, nkv, 1, w.simd_ok)
+    var q = mm_w(ctx, ln1, w.qw[l], w.qb[l], Tq, hd, hd, 1, w.simd_ok)
+    var kk = mm_w(ctx, ln1, w.kw[l], w.kb[l], Tq, hd, nkv, 1, w.simd_ok)
+    var vv = mm_w(ctx, ln1, w.vw[l], w.vb[l], Tq, hd, nkv, 1, w.simd_ok)
     rope_k(ctx, kk, kc, Tq, q_offset, cache_len, w.hkv, w.head_dim, w.arch)   # store K RoPE-rotated
     copy_into(ctx, vv, vc, q_offset * nkv, Tq * nkv, cache_len)               # V is not rotated
     var o = attn_cached(ctx, q, kc, vc, Tq, q_offset, cache_len,
                         w.hidden, w.hq, w.hkv, w.head_dim, w.arch)
-    var o2 = mm(ctx, o, w.ow[l], dummy, Tq, hd, hd, 0, w.simd_ok)
+    var o2 = mm_w(ctx, o, w.ow[l], dummy, Tq, hd, hd, 0, w.simd_ok)
     var h2 = add(ctx, h, o2, Tq * hd)
     var ln2 = rmsnorm(ctx, h2, w.ln2[l], Tq, hd)
-    var g = mm(ctx, ln2, w.gate[l], dummy, Tq, hd, w.inter, 0, w.simd_ok)
-    var u = mm(ctx, ln2, w.up[l], dummy, Tq, hd, w.inter, 0, w.simd_ok)
+    var g = mm_w(ctx, ln2, w.gate[l], dummy, Tq, hd, w.inter, 0, w.simd_ok)
+    var u = mm_w(ctx, ln2, w.up[l], dummy, Tq, hd, w.inter, 0, w.simd_ok)
     var gu = silu_mul(ctx, g, u, Tq * w.inter)
-    var dn = mm(ctx, gu, w.down[l], dummy, Tq, w.inter, hd, 0, w.simd_ok)
+    var dn = mm_w(ctx, gu, w.down[l], dummy, Tq, w.inter, hd, 0, w.simd_ok)
     return add(ctx, h2, dn, Tq * hd)
 
 def argmax_last(ctx: DeviceContext, mut w: Weights, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> Int:

@@ -683,16 +683,22 @@ def main() raises:
         else:
             ckpt = String(String(read_text("tests/fixtures/forward/meta.txt").split("\n")[1]).strip())
 
+    # Optional group-128 int4 weights (QWEN_Q4=1). Projection weights become int4
+    # (embed/lm-head stays bf16); ~4x smaller + ~2x faster decode, at a quality
+    # cost that is coherent on the 3B but degrades the 0.5B (see model.QMat).
+    var q4 = String(getenv("QWEN_Q4")) == "1"
     print("loading tokenizer + weights…")
     var tok = load_tokenizer("tests/fixtures/tokenizer/")
     var tmpl = load_chat_template(TEMPLATE)
     var ctx = DeviceContext()
-    var w = load_weights(ctx, ckpt)
+    var w = load_weights(ctx, ckpt, q4)
     # Probe the simdgroup-matrix GEMM once; on success prefill GEMMs take the
     # ~4.5× faster path, else fall back to the scalar tiled kernel (see mm()).
     w.simd_ok = probe_simd_gemm(ctx)
-    if model_id.byte_length() == 0:   # default id from detected arch
+    if model_id.byte_length() == 0:   # default id from detected arch (+quant tag)
         model_id = String(MODEL_3B) if w.arch == 1 else String(MODEL_05B)
+        if w.quant:
+            model_id += "-int4"       # distinct id + KV-cache dir from the bf16 build
     # One persistent KV cache for the process, sized to the detected arch.
     var sess = new_session(ctx, MAX_SEQ, w.nlayers, w.nkv)
     print("  serving ", model_id, "  (hidden=", w.hidden, ", layers=", w.nlayers,
@@ -701,6 +707,8 @@ def main() raises:
     if not w.simd_ok:
         gemm_path = String("scalar tiled (simd probe failed)")
     print("  prefill GEMM: ", gemm_path, sep="")
+    var wprec = String("group-128 int4 (proj) + bf16 (embed)") if w.quant else String("bf16")
+    print("  weights: ", wprec, sep="")
 
     # Disk-backed prefix cache (per model), survives restarts.
     var kvdir = String(getenv("HOME")) + "/.cache/millrace/kv/" + _slug(model_id)
