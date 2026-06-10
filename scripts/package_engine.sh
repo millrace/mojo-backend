@@ -4,13 +4,13 @@
 # downloads, then `mojo build`s on-device against a separately-fetched Mojo
 # compiler (see millrace/app Bootstrapper). The bundle unzips to three siblings:
 #
-#   mojo-backend/   src + assets +
+#   inference-server/   src + assets +
 #                   build/{libflare_tls.so + libssl.3 + libcrypto.3, rpath-fixed}
 #   jinja2.mojo/src/     vendored jinja2.mojo (chat templating / JSON)
 #   flare/flare/    vendored flare package (HTTP server)
 #
 # so the app can run:
-#   (cd mojo-backend && mojo build src/server.mojo -I ../jinja2.mojo/src -I ../flare -o build/server)
+#   (cd inference-server && mojo build src/server.mojo -I ../jinja2.mojo/src -I ../flare -o build/server)
 #
 # We ship the prebuilt libflare_tls.so (building it needs clang + OpenSSL) and
 # its OpenSSL dylibs, made relocatable via @loader_path so the server finds them
@@ -28,9 +28,9 @@ LIB="$PREFIX/lib/libflare_tls.so"
 [[ -f "$LIB" ]] || { echo "error: $LIB missing — run 'pixi run flare-tls' first" >&2; exit 1; }
 
 STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
-B="$STAGE/mojo-backend"
+B="$STAGE/inference-server"
 
-echo "==> staging mojo-backend source" >&2
+echo "==> staging inference-server source" >&2
 # src + assets (chat template). The tokenizer + model weights are NOT bundled —
 # they're generated/large and ride with the separate model download (the runner
 # fetches them at runtime), so the engine bundle stays small and model-agnostic.
@@ -58,6 +58,6 @@ cp -R "$FLARE/flare" "$STAGE/flare/flare"
 
 echo "==> zipping -> $OUT" >&2
 rm -f "$OUT"
-( cd "$STAGE" && zip -qr -X "$OUT" mojo-backend jinja2.mojo flare )
+( cd "$STAGE" && zip -qr -X "$OUT" inference-server jinja2.mojo flare )
 echo "==> done" >&2
 ls -lh "$OUT" >&2

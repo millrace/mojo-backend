@@ -1,4 +1,4 @@
-# mojo-backend
+# inference-server
 
 > Part of [**millrace**](https://millrace.me) — local-first LLM inference on Apple Silicon.
 

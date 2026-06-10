@@ -1,5 +1,5 @@
 [workspace]
-name = "mojo-backend"
+name = "inference-server"
 version = "0.1.0"
 authors = ["Marius S <marius@seritan.net>"]
 description = "Native-Mojo GPU re-implementation of millrace inference: a hardcoded Qwen2.5-0.5B-Instruct forward pass on Apple Silicon (Metal). See ARCHITECTURE.md."

@@ -1,4 +1,4 @@
-# mojo-backend — Architecture
+# inference-server — Architecture
 
 A **native-Mojo** re-implementation of the millrace inference path. Where
 [`../max-backend`](../max-backend/ARCHITECTURE.md) drives MAX's *Python* pipeline
