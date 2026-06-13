@@ -24,12 +24,12 @@ from safetensors import (
     load_one_bf16, load_named_bf16, load_one_q4, load_proj, fuse_pair,
     concat_bias, gather_tensors,
 )
+from model_iface import ModelConfig, ModelWeights, FAMILY_QWEN, FAMILY_GEMMA, ACT_SILU, ACT_GELU
 from qwen import (
-    ModelConfig, Weights, load_weights, rope_k, rope_kv, attn_cached,
-    qwen_layer, qwen_layer as layer_cached, EOS1, EOS2,
-    FAMILY_QWEN, FLASH_THRESHOLD,
+    Weights, load_weights, rope_k, rope_kv, attn_cached, sess_embed,
+    qwen_layer, qwen_layer as layer_cached, EOS1, EOS2, FLASH_THRESHOLD,
 )
 from engine import (
-    Session, new_session, sess_prefill, sess_embed, sess_prefill_suffix,
+    Session, new_session, sess_prefill, sess_prefill_suffix,
     sess_step, generate, generate_sample, upload_ids, argmax_last, logits_last,
 )

@@ -14,7 +14,7 @@ reused as-is. The `arch` field still selects the comptime-specialized head
 kernels by dim-tuple — that's inherent to comptime specialization, not per-arch
 branching of behavior."""
 
-from std.math import ceildiv
+from std.math import ceildiv, sqrt
 from std.gpu import WARP_SIZE
 from std.gpu.host import DeviceContext, DeviceBuffer
 from layout import TileTensor, row_major
@@ -25,10 +25,13 @@ from kernels import (
 )
 from tensor_ops import (
     BLOCK, DevBuf, WBuf, PBuf, QMat, qmat_bf16, mm_w_norm, mm_w_add, mm_w_silu_add,
+    embed_tokens, mm_norm, last_row, rmsnorm,
 )
 from safetensors import (
     TensorEntry, gather_tensors, load_named, load_named_bf16, load_proj, fuse_pair, concat_bias,
 )
+from model_iface import ModelConfig, ModelWeights, FAMILY_QWEN, ACT_SILU, ACT_GELU
+from engine import new_session, upload_ids
 
 # Qwen2.5-0.5B preset (the default when the checkpoint matches hidden==896).
 comptime HQ = 14
@@ -46,37 +49,12 @@ comptime EOS2 = 151643
 # (shared-memory K/V staging, bit-identical output) wins past the ~20K crossover.
 comptime FLASH_THRESHOLD = 20480
 
-# Model-family tags — `engine` dispatches the forward pass on `ModelConfig.family`.
-comptime FAMILY_QWEN = 0
-# (FAMILY_GEMMA = 1 lands with the Gemma module.)
-
-# Activation tags (Qwen = SiLU SwiGLU).
-comptime ACT_SILU = 0
-comptime ACT_GELU = 1
+# ModelConfig, ModelWeights, FAMILY_*/ACT_* now live in model_iface (shared across
+# families). Qwen's Weights conforms to ModelWeights below.
 
 
 @fieldwise_init
-struct ModelConfig(Copyable, Movable):
-    """Per-model behavior flags + family tag. Captures what differs across model
-    families so the shared engine/ops stay generic; dims live in `Weights`. Qwen
-    leaves every Gemma-only knob off (act=SiLU, softcaps=0, sliding_window=0,
-    norm_offset=0, embed_scale=1)."""
-    var family: Int          # FAMILY_QWEN, … → engine forward dispatch
-    var qkv_bias: Bool       # Qwen2.5 yes, Qwen3 no
-    var qk_norm: Bool        # Qwen3 per-head QK-RMSNorm before RoPE
-    var act: Int             # ACT_SILU / ACT_GELU
-    var attn_softcap: Float32   # 0 = off (Gemma2)
-    var final_softcap: Float32  # 0 = off (Gemma2)
-    var sliding_window: Int     # 0 = global attention everywhere
-    var rope_theta: Float32
-    var embed_scale: Float32    # 1.0 = none (Gemma scales embeddings by √hidden)
-    var norm_offset: Float32    # 0.0 Qwen, 1.0 Gemma ((1+w) RMSNorm)
-    var eos1: Int
-    var eos2: Int
-
-
-@fieldwise_init
-struct Weights(Movable):
+struct Weights(Movable, ModelWeights):
     var embed: WBuf            # bf16 — used as both embedding table and (tied) lm-head
     var final_norm: DevBuf
     var ln1: List[DevBuf]
@@ -111,8 +89,31 @@ struct Weights(Movable):
     # True if the projection weights (qw/kw/vw/ow/gate/up/down) are group-128 int4;
     # embed/lm-head stays bf16 either way. Reported in the startup banner.
     var quant: Bool
-    # Behavior flags + family tag (the engine dispatches the forward on cfg.family).
+    # Behavior flags + engine-relevant dims/eos (the engine is generic over this).
     var cfg: ModelConfig
+
+    # ── ModelWeights conformance (the engine drives the loop via these) ──────────
+    def config(self) -> ModelConfig:
+        return self.cfg
+
+    def embed_prompt(mut self, ctx: DeviceContext, mut ids: DeviceBuffer[DType.int32], T: Int) raises -> DevBuf:
+        return embed_tokens(ctx, ids, self.embed, T, self.hidden, self.vocab)   # Qwen: no embed scale
+
+    def run_layer(mut self, ctx: DeviceContext, l: Int, mut h: DevBuf, mut kc: DevBuf, mut vc: DevBuf,
+                 Tq: Int, q_offset: Int, cache_len: Int, mut dummy: DevBuf) raises -> DevBuf:
+        return qwen_layer(ctx, self, l, h, kc, vc, Tq, q_offset, cache_len, dummy)
+
+    def lm_logits(mut self, ctx: DeviceContext, mut h: DevBuf, T: Int, mut dummy: DevBuf) raises -> List[Float32]:
+        # Final RMSNorm + tied LM head over the last row (Qwen: no final softcap).
+        var hl = last_row(ctx, h, T, self.hidden)
+        var logits = mm_norm(ctx, hl, self.final_norm, self.embed, dummy, 1, self.hidden, self.vocab, 0)
+        ctx.synchronize()
+        var out = List[Float32]()
+        with logits.map_to_host() as m:
+            var mt = TileTensor(m, row_major(self.vocab))
+            for i in range(self.vocab):
+                out.append(rebind[Scalar[DType.float32]](mt[i]))
+        return out^
 
 
 def _hidden_size(entries: List[TensorEntry], name2idx: Dict[String, Int], pfx: String) raises -> Int:
@@ -216,7 +217,7 @@ def load_weights(ctx: DeviceContext, path: String, q4: Bool = False) raises -> W
     # Behavior config: Qwen2.5 (arch 0/1) has QKV bias + no qk-norm; Qwen3 (arch 2)
     # is the reverse. All Gemma-only knobs stay off. θ/ε are shared across Qwen.
     var cfg = ModelConfig(
-        FAMILY_QWEN, arch != 2, arch == 2, ACT_SILU, 0.0, 0.0, 0,
+        FAMILY_QWEN, nlayers, nkv, arch != 2, arch == 2, ACT_SILU, 0.0, 0.0, 0,
         1000000.0, 1.0, 0.0, EOS1, EOS2,
     )
     return Weights(embed^, final_norm^, ln1^, qkv^, qkv_b^, ow^, ln2^, gate_up^, down^,
@@ -439,3 +440,32 @@ def qwen_layer(ctx: DeviceContext, mut w: Weights, l: Int, mut h: DevBuf,
     var gu = mm_w_norm(ctx, h2, w.ln2[l], w.gate_up[l], dummy, Tq, hd, 2 * w.inter, 0, w.simd_ok)   # [gate|up]
     # down-proj with SwiGLU fused on input + residual on output (one launch at decode).
     return mm_w_silu_add(ctx, gu, w.down[l], h2, Tq, w.inter, hd, w.simd_ok)           # down(silu(gate)·up) + h2
+
+
+def sess_embed(ctx: DeviceContext, mut w: Weights, prompt: List[Int]) raises -> List[Float32]:
+    """Qwen3-Embedding sentence vector for `prompt`: run the full decoder, take the
+    LAST token's hidden state (official Qwen3-Embedding last-token pooling — the ids
+    already carry the appended EOS), apply the final RMSNorm, then L2-normalize.
+    Embedding-specific, so it lives in the Qwen module (not the generic engine).
+    Runs its own one-shot Session (no KV reuse). Returns the D-element unit vector."""
+    var P = len(prompt)
+    var s = new_session(ctx, P + 2, w.nlayers, w.nkv)
+    var ids_dev = upload_ids(ctx, prompt)
+    var h = embed_tokens(ctx, ids_dev, w.embed, P, w.hidden, w.vocab)
+    for l in range(w.nlayers):
+        h = qwen_layer(ctx, w, l, h, s.kcs[l], s.vcs[l], P, 0, s.cache_len, s.dummy)
+    var hl = last_row(ctx, h, P, w.hidden)
+    var hn = rmsnorm(ctx, hl, w.final_norm, 1, w.hidden)
+    ctx.synchronize()
+    var out = List[Float32]()
+    var ss = Float32(0.0)
+    with hn.map_to_host() as m:
+        var mt = TileTensor(m, row_major(w.hidden))
+        for i in range(w.hidden):
+            var v = rebind[Scalar[DType.float32]](mt[i])
+            out.append(v)
+            ss += v * v
+    var inv = Float32(1.0) / sqrt(ss)
+    for i in range(len(out)):
+        out[i] = out[i] * inv
+    return out^
